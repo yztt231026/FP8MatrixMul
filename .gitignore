@@ -1,0 +1,6 @@
+*.o
+*.out
+*.bin
+matmul_fp8_test
+fp8_server
+input/
