@@ -1,7 +1,8 @@
 //============================================================================
 // FP8 查表法矩阵乘法 - 服务器性能测试 (ARM SVE + NUMA)
-// 目标平台: HiSilicon Kunpeng (鲲鹏), 80核×4路, SVE
-// 编译: g++ -O3 -fopenmp -march=armv8.2-a+sve -o fp8_server matmul_fp8_server.cpp
+// 目标平台: HiSilicon Kunpeng (鲲鹏), EulerOS, 80核×4路, SVE
+// 编译: g++ -O3 -fopenmp -march=armv8.2-a+sve -o fp8_server matmul_fp8_server.cpp -std=c++17 -lnuma
+// 依赖: sudo dnf install -y numactl-devel
 // 运行: OMP_PLACES=cores OMP_PROC_BIND=close ./fp8_server
 //============================================================================
 #include <iostream>

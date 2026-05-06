@@ -136,10 +136,8 @@ Socket 0        Socket 1        Socket 2        Socket 3
 ### 3.1 编译
 
 ```bash
-# 依赖: libnuma-dev
-sudo yum install -y numactl-devel   # CentOS/openEuler
-# 或
-sudo apt install -y libnuma-dev      # Ubuntu
+# 依赖: libnuma (EulerOS / openEuler)
+sudo dnf install -y numactl-devel
 
 # 编译
 g++ -O3 -fopenmp -march=armv8.2-a+sve \
@@ -163,8 +161,8 @@ numactl --cpunodebind=0 --membind=0 ./fp8_server
 ### 3.3 Cache Miss 分析
 
 ```bash
-# 安装 perf (openEuler)
-sudo yum install -y perf
+# 安装 perf (EulerOS)
+sudo dnf install -y perf
 
 # 对比无 tile / 有 tile 时的 L2 miss
 perf stat -e L1-dcache-load-misses,l2d_cache_refill,ll_cache_miss \

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(g++ -O3 -fopenmp -march=native -o matmul_fp8_test matmul_fp8_lookup_test.cpp -std=c++17)",
+      "Bash(OMP_NUM_THREADS=10 OMP_PROC_BIND=true ./matmul_fp8_test)"
+    ]
+  }
+}
