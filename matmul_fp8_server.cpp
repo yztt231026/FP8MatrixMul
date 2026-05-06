@@ -172,20 +172,25 @@ void print_numa_info() {
     }
 }
 
+/** 获取指定 NUMA node 上所有 CPU ID 列表 */
+std::vector<int> cpus_on_node(int node) {
+    std::vector<int> result;
+    if (numa_available() < 0) return result;
+    struct bitmask *mask = numa_allocate_cpumask();
+    if (numa_node_to_cpus(node, mask) == 0) {
+        for (int i = 0; i < numa_num_configured_cpus(); i++) {
+            if (numa_bitmask_isbitset(mask, i))
+                result.push_back(i);
+        }
+    }
+    numa_free_cpumask(mask);
+    return result;
+}
+
 /** 获取指定 NUMA node 的第一个 CPU ID */
 int first_cpu_on_node(int node) {
-    if (numa_available() < 0) return 0;
-    struct bitmask *cpus = numa_allocate_cpumask();
-    if (numa_node_to_cpus(node, cpus) != 0) {
-        numa_free_cpumask(cpus);
-        return 0;
-    }
-    int cpu = -1;
-    for (int i = 0; i < numa_num_configured_cpus(); i++) {
-        if (numa_bitmask_isbitset(cpus, i)) { cpu = i; break; }
-    }
-    numa_free_cpumask(cpus);
-    return (cpu >= 0) ? cpu : 0;
+    auto cpus = cpus_on_node(node);
+    return cpus.empty() ? 0 : cpus[0];
 }
 
 /** 在指定 CPU 集合上运行 */
@@ -421,16 +426,18 @@ void exp4_cross_numa(const float *table, int N, int S, int L) {
     omp_set_num_threads(1);
     lookup_sve(table, A.data(), B_T.data(), ref.data(), N, S, L);
 
-    // 跨 NUMA 配置
+    // 跨 NUMA 配置 — 直接尝试硬编码的线程数，不依赖 omp_get_max_threads
     struct NumaConfig {
         const char* desc;
         int thread_count;
     };
-    std::vector<NumaConfig> configs;
-    int max_t = omp_get_max_threads();
-    for (int t : {1, 80, 160, 240, 320})
-        if (t <= max_t) configs.push_back({std::to_string(t).c_str(), t});
-    if (max_t > 320) configs.push_back({std::to_string(max_t).c_str(), max_t});
+    std::vector<NumaConfig> configs = {
+        {"1", 1},
+        {"80 (1 node)", 80},
+        {"160 (2 nodes)", 160},
+        {"240 (3 nodes)", 240},
+        {"320 (4 nodes)", 320},
+    };
 
     const int Ni = 32, Sj = 128;
 
@@ -629,17 +636,15 @@ int main() {
     // 实验1: SVE 加速比 (1 核)
     exp1_sve_speedup(LUT.data(), A.data(), B_T.data(), N1, S1, L1);
 
-    // 实验2: Tile 扫描 (SVE, 使用 80 核 = 1 NUMA node)
-    exp2_tile_sweep(LUT.data(), A.data(), B_T.data(), C_ref.data(), N1, S1, L1,
-                    std::min(80, omp_get_max_threads()));
+    // 实验2: Tile 扫描 (SVE, 80 核 = 1 NUMA node)
+    exp2_tile_sweep(LUT.data(), A.data(), B_T.data(), C_ref.data(), N1, S1, L1, 80);
 
     // 实验3: NUMA node 内多核扩展 (SVE, 使用首节点 CPU)
     {
         int numa_node = 0;
-        int first_cpu = first_cpu_on_node(numa_node);
-        std::vector<int> cpus;
-        for (int i = first_cpu; i < first_cpu + 80 && i < omp_get_max_threads(); i++)
-            cpus.push_back(i);
+        auto cpus = cpus_on_node(numa_node);
+        std::cout << "  Node " << numa_node << " CPUs: " << cpus.size() << " 个 ("
+                  << cpus.front() << "~" << cpus.back() << ")\n";
         exp3_numa_scaling(LUT.data(), A.data(), B_T.data(), C_ref.data(),
                          N1, S1, L1, numa_node, cpus);
     }
