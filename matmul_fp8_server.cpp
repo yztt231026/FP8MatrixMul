@@ -220,7 +220,7 @@ bool verify(const float *ref, const float *result, int n, float tol = 1e-3f) {
 }
 
 double calc_gops(int N, int S, int L, double us) {
-    return N * S * L / us / 1e3;  // L 次查表/us → GOP/s
+    return double(N) * double(S) * double(L) / us / 1e3;
 }
 
 // ====================== 实验1：SVE 加速比 ======================
