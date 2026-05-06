@@ -16,6 +16,7 @@
 #include <arm_sve.h>
 #include <omp.h>
 #include <sstream>
+#include <functional>
 #include <unistd.h>
 #include <numa.h>
 
