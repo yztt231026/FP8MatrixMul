@@ -605,7 +605,14 @@ void exp5_matrix_scaling(const float *table) {
     }
 }
 
-// ====================== 实验6：L1 分组建表查表 ======================
+// ====================== 实验6：L1 分组建表查表 (BF16 子表) ======================
+
+/** float → BF16 (取 float32 的高 16 位) */
+static inline uint16_t float_to_bf16(float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, 4);
+    return bits >> 16;
+}
 
 /** 预处理：为每行 A 构建组索引 */
 struct GroupData {
@@ -648,23 +655,24 @@ static GroupData preprocess_groups(const uint8_t *A, int N, int L, int G) {
     return d;
 }
 
-/** 从完整 LUT 切出 G 个子表（float） */
-static void build_subtables(int G, std::vector<std::vector<float>> &subtables,
-                            const float *lut) {
+/** 从完整 LUT 切出 G 个子表（BF16 格式，2B/entry） */
+static void build_subtables_bf16(int G,
+                                  std::vector<std::vector<uint16_t>> &subtables,
+                                  const float *lut) {
     int step = 256 / G;
     subtables.resize(G);
     for (int g = 0; g < G; ++g) {
         subtables[g].resize(step * 256);
         for (int a = 0; a < step; ++a)
             for (int b = 0; b < 256; ++b)
-                subtables[g][a * 256 + b] = lut[(g * step + a) * 256 + b];
+                subtables[g][a * 256 + b] = float_to_bf16(lut[(g * step + a) * 256 + b]);
     }
 }
 
-/** G 核 SVE 分组建表查表：
-    每核持一个子表，阶段1标量收集B_T，阶段2 SVE向量化查子表(L1) */
+/** G 核 SVE 分组建表查表（BF16 子表）：
+    标量收集 B_T + BF16 子表查表，SVE 向量化累加 */
 void lookup_sve_grouped_omp(const GroupData &data,
-                            const std::vector<std::vector<float>> &subtables,
+                            const std::vector<std::vector<uint16_t>> &subtables,
                             const uint8_t *B_T, float *C,
                             int N, int S, int L,
                             float *core_times, float &sync_time) {
@@ -673,7 +681,7 @@ void lookup_sve_grouped_omp(const GroupData &data,
     #pragma omp parallel num_threads(G)
     {
         int g = omp_get_thread_num();
-        const float *sub = subtables[g].data();
+        const uint16_t *sub = subtables[g].data();
         int base = g * step;
 
         double t0 = omp_get_wtime();
@@ -687,27 +695,25 @@ void lookup_sve_grouped_omp(const GroupData &data,
             for (int j = 0; j < S; ++j) {
                 const uint8_t *b_row = B_T + j * L;
 
-                // 阶段1: 收集 B_T 值（标量按 k 索引随机加载）
-                alignas(16) uint8_t b_local[512];
-                for (int t = 0; t < count; ++t)
-                    b_local[t] = b_row[k_ptr[t]];
+                // 合并阶段：标量收集 B_T + BF16 子表查表 + 转 float
+                // 子表全部 L1 命中，标量加载延迟低
+                alignas(64) float local_vals[512];
+                for (int t = 0; t < count; ++t) {
+                    int b_val = b_row[k_ptr[t]];
+                    int idx = (a_ptr[t] - base) * 256 + b_val;
+                    uint32_t bits = (uint32_t)sub[idx] << 16;
+                    memcpy(local_vals + t, &bits, 4);
+                }
 
-                // 阶段2: SVE 向量化查子表（全部 L1 命中）
+                // SVE 向量化累加
                 svfloat32_t acc = svdup_n_f32(0.0f);
                 int t = 0;
                 svbool_t pg = svwhilelt_b32(t, count);
                 while (svptest_any(svptrue_b32(), pg)) {
-                    svuint32_t a_vals = svld1ub_u32(pg, a_ptr + t);
-                    svuint32_t b_vals = svld1ub_u32(pg, b_local + t);
-                    svuint32_t idx = svorr_u32_z(pg,
-                        svlsl_n_u32_z(pg, svsub_n_u32_z(pg, a_vals, base), 8),
-                        b_vals);
-                    acc = svadd_f32_z(pg, acc,
-                        svld1_gather_u32index_f32(pg, sub, idx));
+                    acc = svadd_f32_z(pg, acc, svld1_f32(pg, local_vals + t));
                     t += svcntw();
                     pg = svwhilelt_b32(t, count);
                 }
-
                 #pragma omp atomic
                 C[i * S + j] += svaddv_f32(svptrue_b32(), acc);
             }
@@ -729,7 +735,7 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
     std::cout << "实验6: L1 分组建表查表试验 (SVE, " << num_threads << " 核)\n";
     std::cout << std::string(70, '=') << "\n";
     std::cout << "矩阵: " << N << "×" << L << " * " << S << "×" << L << "^T\n";
-    std::cout << "L1d = " << L1D_KiB << " KiB, 子表格式: float (4B)\n\n";
+    std::cout << "L1d = " << L1D_KiB << " KiB, 子表格式: BF16 (2B)\n\n";
 
     auto gops = [&](double us) { return double(N) * S * L / us / 1e3; };
 
@@ -774,10 +780,10 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
         if (Gi > N * S) continue;  // 至少每个线程一个元素
 
         GroupData gd = preprocess_groups(A, N, L, Gi);
-        std::vector<std::vector<float>> subs;
-        build_subtables(Gi, subs, table);
+        std::vector<std::vector<uint16_t>> subs;
+        build_subtables_bf16(Gi, subs, table);
 
-        int sub_kib = (256 / Gi) * 256 * 4 / 1024;
+        int sub_kib = (256 / Gi) * 256 * 2 / 1024;
         const char *cl = cache_level(sub_kib, L1D_KiB, L2_KiB);
 
         std::vector<float> C_g(N * S, 0);
@@ -818,7 +824,7 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
         else
             ss_sub << std::fixed << std::setprecision(1) << (sub_kib / 1024.0) << " MiB";
 
-        bool ok = verify(ref, C_g.data(), N * S);
+        bool ok = verify(ref, C_g.data(), N * S, 0.1f);
 
         std::ostringstream ss_comp;
         ss_comp << std::fixed << std::setprecision(1) << cmin << "~" << cmax;
