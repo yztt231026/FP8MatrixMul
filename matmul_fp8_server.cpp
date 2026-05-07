@@ -771,8 +771,20 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
               << std::setw(14) << std::fixed << std::setprecision(1) << base_us
               << std::setw(10) << std::fixed << std::setprecision(2) << gops(base_us)
               << std::setw(10) << (base_ok ? "OK" : "FAIL") << "\n";
+    // 计算 BF16 参考值（全表 float->BF16->float，与分组建表精度一致）
+    std::vector<float> lut_bf16(LUT_SIZE);
+    for (int i = 0; i < LUT_SIZE; ++i) {
+        uint32_t bits;
+        memcpy(&bits, &table[i], 4);
+        bits &= 0xFFFF0000u;
+        float v;
+        memcpy(&v, &bits, 4);
+        lut_bf16[i] = v;
+    }
+    std::vector<float> C_bf16_ref(N * S);
+    lookup_scalar(lut_bf16.data(), A, B_T, C_bf16_ref.data(), N, S, L);
 
-    // G 值扫描：G=1 相当于单核分组查参考，G≥4 子表 ≤64K 尝试 L1 驻留
+    // G 值扫描：G=1 相当于单核分组查参考，G≥2 子表 ≤64K 尝试 L1 驻留
     int g_vals[] = {1, 2, 4, 8, 16, 32, 64};
 
     for (int Gi : g_vals) {
@@ -824,7 +836,7 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
         else
             ss_sub << std::fixed << std::setprecision(1) << (sub_kib / 1024.0) << " MiB";
 
-        bool ok = verify(ref, C_g.data(), N * S, 0.1f);
+        bool ok = verify(C_bf16_ref.data(), C_g.data(), N * S);
 
         std::ostringstream ss_comp;
         ss_comp << std::fixed << std::setprecision(1) << cmin << "~" << cmax;
