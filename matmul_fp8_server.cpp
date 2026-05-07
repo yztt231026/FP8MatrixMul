@@ -710,7 +710,7 @@ void lookup_sve_grouped_omp(const GroupData &data,
                 int t = 0;
                 svbool_t pg = svwhilelt_b32(t, count);
                 while (svptest_any(svptrue_b32(), pg)) {
-                    acc = svadd_f32_z(pg, acc, svld1_f32(pg, local_vals + t));
+                    acc = svadd_f32_m(pg, acc, svld1_f32(pg, local_vals + t));
                     t += svcntw();
                     pg = svwhilelt_b32(t, count);
                 }
