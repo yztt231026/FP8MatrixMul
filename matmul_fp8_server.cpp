@@ -700,7 +700,7 @@ void lookup_sve_grouped_omp(const GroupData &data,
                     svuint32_t a_vals = svld1ub_u32(pg, a_ptr + t);
                     svuint32_t b_vals = svld1ub_u32(pg, b_local + t);
                     svuint32_t idx = svorr_u32_z(pg,
-                        svlsl_n_u32_z(pg, svsub_u32_z(pg, a_vals, base), 8),
+                        svlsl_n_u32_z(pg, svsub_n_u32_z(pg, a_vals, base), 8),
                         b_vals);
                     acc = svadd_f32_z(pg, acc,
                         svld1_gather_u32index_f32(pg, sub, idx));
