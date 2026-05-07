@@ -20,6 +20,8 @@
 #include <algorithm>
 #include <unistd.h>
 #include <numa.h>
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
 
 using TimePoint = std::chrono::high_resolution_clock::time_point;
 using namespace std::chrono;
@@ -227,6 +229,56 @@ bool verify(const float *ref, const float *result, int n, float tol = 1e-3f) {
 
 double calc_gops(int N, int S, int L, double us) {
     return double(N) * double(S) * double(L) / us / 1e3;
+}
+
+// ====================== Perf 计数器 (ARM PMU) ======================
+
+/** Linux perf_event_open 封装，用于采集 ARM PMU 硬件事件 */
+class PerfCounter {
+    int fd_ = -1;
+
+    static long sys_open(struct perf_event_attr *pea, pid_t pid, int cpu,
+                         int group_fd, unsigned long flags) {
+        return syscall(__NR_perf_event_open, pea, pid, cpu, group_fd, flags);
+    }
+
+public:
+    PerfCounter(uint64_t config, bool exclude_kernel = true) {
+        struct perf_event_attr pea{};
+        pea.type = PERF_TYPE_RAW;
+        pea.size = sizeof(pea);
+        pea.config = config;
+        pea.disabled = 1;      // start disabled
+        pea.pinned = 1;         // require counter to be on PMU
+        pea.exclude_kernel = exclude_kernel ? 1 : 0;
+        pea.exclude_hv = 1;
+        fd_ = sys_open(&pea, 0, -1, -1, 0);
+    }
+
+    ~PerfCounter() { if (fd_ >= 0) close(fd_); }
+    bool ok() const { return fd_ >= 0; }
+
+    void enable()  { if (fd_ >= 0) ioctl(fd_, PERF_EVENT_IOC_ENABLE, 0); }
+    void disable() { if (fd_ >= 0) ioctl(fd_, PERF_EVENT_IOC_DISABLE, 0); }
+    void reset()   { if (fd_ >= 0) ioctl(fd_, PERF_EVENT_IOC_RESET, 0); }
+
+    uint64_t read() {
+        uint64_t val = 0;
+        if (fd_ >= 0) {
+            if (::read(fd_, &val, sizeof(val)) != sizeof(val)) return 0;
+        }
+        return val;
+    }
+};
+
+/** ARMv8.0 PMU 事件编码（鲲鹏 920 兼容） */
+namespace ArmPmu {
+    // Standard ARMv8 events
+    constexpr uint64_t L1D_CACHE        = 0x04;  // L1 data cache access
+    constexpr uint64_t L1D_CACHE_REFILL = 0x03;  // L1 data cache refill (miss)
+    // Implementation-defined (Kunpeng should support)
+    constexpr uint64_t L2D_CACHE        = 0x16;  // L2 data cache access
+    constexpr uint64_t L2D_CACHE_REFILL = 0x17;  // L2 data cache refill
 }
 
 // ====================== 实验1：SVE 加速比 ======================
@@ -735,45 +787,21 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
     std::cout << "实验6: L1 分组建表查表试验 (SVE, " << num_threads << " 核)\n";
     std::cout << std::string(70, '=') << "\n";
     std::cout << "矩阵: " << N << "×" << L << " * " << S << "×" << L << "^T\n";
-    std::cout << "L1d = " << L1D_KiB << " KiB, 子表格式: BF16 (2B)\n\n";
+    std::cout << "L1d = " << L1D_KiB << " KiB, 子表格式: BF16 (2B)\n";
+    std::cout << "Warmup=" << 100 << ", 采样=" << 1000 << "\n\n";
 
     auto gops = [&](double us) { return double(N) * S * L / us / 1e3; };
 
-    // 基线：SVE + OpenMP 无分组
+    // ——— 基线：SVE + OpenMP 无分组 ———
     omp_set_num_threads(num_threads);
     std::vector<float> C_bl(N * S);
     double base_us = bench([&]() {
         memset(C_bl.data(), 0, N * S * sizeof(float));
         lookup_sve_omp(table, A, B_T, C_bl.data(), N, S, L);
     });
-
     bool base_ok = verify(ref, C_bl.data(), N * S);
 
-    std::cout << std::left
-              << std::setw(10) << "方案"
-              << std::setw(8) << "线程"
-              << std::setw(14) << "子表"
-              << std::setw(8) << "级别"
-              << std::setw(18) << "计算(核min~max)"
-              << std::setw(12) << "同步"
-              << std::setw(14) << "预处理"
-              << std::setw(14) << "总耗时(us)"
-              << std::setw(10) << "GOP/s"
-              << std::setw(10) << "正确"
-              << "\n" << std::string(120, '-') << "\n";
-
-    std::cout << std::left
-              << std::setw(10) << "基线SVE"
-              << std::setw(8) << num_threads
-              << std::setw(14) << "256 KiB"
-              << std::setw(8) << "L2"
-              << std::setw(18) << "—"
-              << std::setw(12) << "—"
-              << std::setw(14) << "—"
-              << std::setw(14) << std::fixed << std::setprecision(1) << base_us
-              << std::setw(10) << std::fixed << std::setprecision(2) << gops(base_us)
-              << std::setw(10) << (base_ok ? "OK" : "FAIL") << "\n";
-    // 计算 BF16 参考值（全表 float->BF16->float，与分组建表精度一致）
+    // ——— BF16 参考值 ———
     std::vector<float> lut_bf16(LUT_SIZE);
     for (int i = 0; i < LUT_SIZE; ++i) {
         uint32_t bits;
@@ -786,14 +814,49 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
     std::vector<float> C_bf16_ref(N * S);
     lookup_scalar(lut_bf16.data(), A, B_T, C_bf16_ref.data(), N, S, L);
 
-    // G 值扫描：G=1 相当于单核分组查参考，G≥2 子表 ≤64K 尝试 L1 驻留
-    int g_vals[] = {1, 2, 4, 8, 16, 32, 64};
+    // ——— 输出表头 ———
+    std::cout << std::left
+              << std::setw(10) << "方案"
+              << std::setw(8) << "线程"
+              << std::setw(14) << "子表"
+              << std::setw(8) << "级别"
+              << std::setw(18) << "计算(核min~max)"
+              << std::setw(12) << "同步"
+              << std::setw(14) << "预处理"
+              << std::setw(12) << "L1-miss%"
+              << std::setw(12) << "L2-miss%"
+              << std::setw(18) << "总耗时mean±sd"
+              << std::setw(12) << "总耗时min"
+              << std::setw(10) << "GOP/s"
+              << std::setw(10) << "正确"
+              << "\n" << std::string(150, '-') << "\n";
 
-    for (int Gi : g_vals) {
+    // 基线行
+    std::cout << std::left
+              << std::setw(10) << "基线SVE"
+              << std::setw(8) << num_threads
+              << std::setw(14) << "256 KiB"
+              << std::setw(8) << "L2"
+              << std::setw(18) << "—"
+              << std::setw(12) << "—"
+              << std::setw(14) << "—"
+              << std::setw(12) << "—"
+              << std::setw(12) << "—"
+              << std::setw(18) << std::fixed << std::setprecision(1) << base_us
+              << std::setw(12) << "—"
+              << std::setw(10) << std::fixed << std::setprecision(2) << gops(base_us)
+              << std::setw(10) << (base_ok ? "OK" : "FAIL") << "\n";
+
+    // ——— 扫描 G ———
+    constexpr int G_VALS[] = {1, 2, 4, 8, 16, 32, 64};
+    constexpr int WARMUP = 100;
+    constexpr int ITERS = 1000;
+
+    for (int Gi : G_VALS) {
         if (Gi > omp_get_max_threads()) continue;
-        if (Gi > N * S) continue;  // 至少每个线程一个元素
+        if (Gi > N * S) continue;
 
-        // 计时：预处理（分组重排 + 子表构建）
+        // ── 预处理（计时） ──
         double t_prep = omp_get_wtime();
         GroupData gd = preprocess_groups(A, N, L, Gi);
         std::vector<std::vector<uint16_t>> subs;
@@ -803,27 +866,62 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
         int sub_kib = (256 / Gi) * 256 * 2 / 1024;
         const char *cl = cache_level(sub_kib, L1D_KiB, L2_KiB);
 
+        // ── Perf 计数器（打开失败则降级） ──
+        PerfCounter pc_l1_acc(ArmPmu::L1D_CACHE);
+        PerfCounter pc_l1_miss(ArmPmu::L1D_CACHE_REFILL);
+        PerfCounter pc_l2_acc(ArmPmu::L2D_CACHE);
+        PerfCounter pc_l2_miss(ArmPmu::L2D_CACHE_REFILL);
+        bool perf_ok = pc_l1_acc.ok() && pc_l1_miss.ok();
+
+        // ── 复用缓冲区 ──
         std::vector<float> C_g(N * S, 0);
         std::vector<float> core_t(Gi);
         float sync_t = 0;
 
-        // warmup 1 次
-        lookup_sve_grouped_omp(gd, subs, B_T, C_g.data(), N, S, L,
-                                core_t.data(), sync_t);
+        // ── Warmup ──
+        for (int w = 0; w < WARMUP; ++w) {
+            std::fill(C_g.begin(), C_g.end(), 0);
+            lookup_sve_grouped_omp(gd, subs, B_T, C_g.data(), N, S, L,
+                                   core_t.data(), sync_t);
+        }
 
-        // 正式测量（多次取最优总耗时）
+        // ── 测量 ──
+        // 在线统计：总耗时
+        double sum_total = 0, sum_total2 = 0;
+        double min_total = 1e18, max_total = 0;
+        // 同步时间
+        double sum_sync = 0;
+        // 最佳单次（用于输出 compute min~max）
         double best_total = 1e18;
         float best_sync = 0;
         std::vector<float> best_core(Gi);
-        for (int run = 0; run < 3; ++run) {
+
+        // 启动 perf 计数器（从第一次测量开始累计）
+        if (perf_ok) {
+            pc_l1_acc.reset(); pc_l1_acc.enable();
+            pc_l1_miss.reset(); pc_l1_miss.enable();
+            if (pc_l2_acc.ok()) { pc_l2_acc.reset(); pc_l2_acc.enable(); }
+            if (pc_l2_miss.ok()) { pc_l2_miss.reset(); pc_l2_miss.enable(); }
+        }
+
+        for (int iter = 0; iter < ITERS; ++iter) {
             std::fill(C_g.begin(), C_g.end(), 0);
             std::fill(core_t.begin(), core_t.end(), 0);
             sync_t = 0;
 
             lookup_sve_grouped_omp(gd, subs, B_T, C_g.data(), N, S, L,
-                                    core_t.data(), sync_t);
+                                   core_t.data(), sync_t);
 
             double total = *std::max_element(core_t.begin(), core_t.end()) + sync_t;
+
+            // 更新在线统计
+            sum_total += total;
+            sum_total2 += total * total;
+            if (total < min_total) min_total = total;
+            if (total > max_total) max_total = total;
+            sum_sync += sync_t;
+
+            // 记录最优单次（用于输出计算核时间）
             if (total < best_total) {
                 best_total = total;
                 best_sync = sync_t;
@@ -831,20 +929,61 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
             }
         }
 
+        // 停止 perf 计数器
+        if (perf_ok) {
+            pc_l1_acc.disable();
+            pc_l1_miss.disable();
+            if (pc_l2_acc.ok()) pc_l2_acc.disable();
+            if (pc_l2_miss.ok()) pc_l2_miss.disable();
+        }
+
+        // ── 统计计算 ──
+        double mean_total = sum_total / ITERS;
+        double var_total = (sum_total2 - sum_total * mean_total) / (ITERS - 1);
+        double sd_total = std::sqrt(std::max(0.0, var_total));
+        double avg_sync = sum_sync / ITERS;
+
         float cmin = *std::min_element(best_core.begin(), best_core.end());
         float cmax = *std::max_element(best_core.begin(), best_core.end());
-        double gops_v = gops(best_total);
+        double gops_min = gops(min_total);
 
+        // ── Cache miss rate ──
+        double l1_miss_rate = -1, l2_miss_rate = -1;
+        if (perf_ok) {
+            uint64_t l1_a = pc_l1_acc.read();
+            uint64_t l1_m = pc_l1_miss.read();
+            if (l1_a > 0) l1_miss_rate = 100.0 * l1_m / l1_a;
+
+            if (pc_l2_acc.ok() && pc_l2_miss.ok()) {
+                uint64_t l2_a = pc_l2_acc.read();
+                uint64_t l2_m = pc_l2_miss.read();
+                if (l2_a > 0) l2_miss_rate = 100.0 * l2_m / l2_a;
+            }
+        }
+
+        bool ok = verify(C_bf16_ref.data(), C_g.data(), N * S);
+
+        // ── 输出 ──
         std::ostringstream ss_sub;
         if (sub_kib < 1024)
             ss_sub << sub_kib << " KiB";
         else
             ss_sub << std::fixed << std::setprecision(1) << (sub_kib / 1024.0) << " MiB";
 
-        bool ok = verify(C_bf16_ref.data(), C_g.data(), N * S);
-
         std::ostringstream ss_comp;
         ss_comp << std::fixed << std::setprecision(1) << cmin << "~" << cmax;
+
+        std::ostringstream ss_total;
+        ss_total << std::fixed << std::setprecision(1) << mean_total
+                 << "±" << std::setprecision(1) << sd_total;
+
+        // L1 miss rate 字符串
+        std::string s_l1mr = (l1_miss_rate >= 0)
+            ? (std::ostringstream() << std::fixed << std::setprecision(2) << l1_miss_rate << "%").str()
+            : "—";
+        std::string s_l2mr = (l2_miss_rate >= 0)
+            ? (std::ostringstream() << std::fixed << std::setprecision(2) << l2_miss_rate << "%").str()
+            : "—";
 
         std::cout << std::left
                   << std::setw(10) << ("G=" + std::to_string(Gi)).c_str()
@@ -852,10 +991,13 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
                   << std::setw(14) << ss_sub.str()
                   << std::setw(8) << cl
                   << std::setw(18) << ss_comp.str()
-                  << std::setw(12) << std::fixed << std::setprecision(1) << best_sync
+                  << std::setw(12) << std::fixed << std::setprecision(1) << avg_sync
                   << std::setw(14) << std::fixed << std::setprecision(1) << prep_us
-                  << std::setw(14) << std::fixed << std::setprecision(1) << best_total
-                  << std::setw(10) << std::fixed << std::setprecision(2) << gops_v
+                  << std::setw(12) << s_l1mr
+                  << std::setw(12) << s_l2mr
+                  << std::setw(18) << ss_total.str()
+                  << std::setw(12) << std::fixed << std::setprecision(1) << min_total
+                  << std::setw(10) << std::fixed << std::setprecision(2) << gops_min
                   << std::setw(10) << (ok ? "OK" : "FAIL") << "\n";
     }
     std::cout << "\n";
