@@ -19,6 +19,7 @@
 #include <functional>
 #include <algorithm>
 #include <unistd.h>
+#include <sys/ioctl.h>
 #include <numa.h>
 #include <linux/perf_event.h>
 #include <sys/syscall.h>
@@ -978,12 +979,16 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
                  << "±" << std::setprecision(1) << sd_total;
 
         // L1 miss rate 字符串
-        std::string s_l1mr = (l1_miss_rate >= 0)
-            ? (std::ostringstream() << std::fixed << std::setprecision(2) << l1_miss_rate << "%").str()
-            : "—";
-        std::string s_l2mr = (l2_miss_rate >= 0)
-            ? (std::ostringstream() << std::fixed << std::setprecision(2) << l2_miss_rate << "%").str()
-            : "—";
+        std::string s_l1mr = "—";
+        if (l1_miss_rate >= 0) {
+            std::ostringstream ss; ss << std::fixed << std::setprecision(2) << l1_miss_rate << "%";
+            s_l1mr = ss.str();
+        }
+        std::string s_l2mr = "—";
+        if (l2_miss_rate >= 0) {
+            std::ostringstream ss; ss << std::fixed << std::setprecision(2) << l2_miss_rate << "%";
+            s_l2mr = ss.str();
+        }
 
         std::cout << std::left
                   << std::setw(10) << ("G=" + std::to_string(Gi)).c_str()
