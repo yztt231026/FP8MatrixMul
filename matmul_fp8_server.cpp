@@ -756,10 +756,11 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
               << std::setw(8) << "级别"
               << std::setw(18) << "计算(核min~max)"
               << std::setw(12) << "同步"
+              << std::setw(14) << "预处理"
               << std::setw(14) << "总耗时(us)"
               << std::setw(10) << "GOP/s"
               << std::setw(10) << "正确"
-              << "\n" << std::string(115, '-') << "\n";
+              << "\n" << std::string(120, '-') << "\n";
 
     std::cout << std::left
               << std::setw(10) << "基线SVE"
@@ -768,6 +769,7 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
               << std::setw(8) << "L2"
               << std::setw(18) << "—"
               << std::setw(12) << "—"
+              << std::setw(14) << "—"
               << std::setw(14) << std::fixed << std::setprecision(1) << base_us
               << std::setw(10) << std::fixed << std::setprecision(2) << gops(base_us)
               << std::setw(10) << (base_ok ? "OK" : "FAIL") << "\n";
@@ -791,9 +793,12 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
         if (Gi > omp_get_max_threads()) continue;
         if (Gi > N * S) continue;  // 至少每个线程一个元素
 
+        // 计时：预处理（分组重排 + 子表构建）
+        double t_prep = omp_get_wtime();
         GroupData gd = preprocess_groups(A, N, L, Gi);
         std::vector<std::vector<uint16_t>> subs;
         build_subtables_bf16(Gi, subs, table);
+        double prep_us = (omp_get_wtime() - t_prep) * 1e6;
 
         int sub_kib = (256 / Gi) * 256 * 2 / 1024;
         const char *cl = cache_level(sub_kib, L1D_KiB, L2_KiB);
@@ -848,6 +853,7 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
                   << std::setw(8) << cl
                   << std::setw(18) << ss_comp.str()
                   << std::setw(12) << std::fixed << std::setprecision(1) << best_sync
+                  << std::setw(14) << std::fixed << std::setprecision(1) << prep_us
                   << std::setw(14) << std::fixed << std::setprecision(1) << best_total
                   << std::setw(10) << std::fixed << std::setprecision(2) << gops_v
                   << std::setw(10) << (ok ? "OK" : "FAIL") << "\n";
