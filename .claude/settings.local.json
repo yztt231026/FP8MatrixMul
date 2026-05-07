@@ -5,7 +5,8 @@
       "Bash(OMP_NUM_THREADS=10 OMP_PROC_BIND=true ./matmul_fp8_test)",
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
-      "Bash(git push *)"
+      "Bash(git push *)",
+      "Bash(git commit *)"
     ]
   }
 }
