@@ -1010,7 +1010,11 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
 
 // ====================== Main ======================
 
-int main() {
+int main(int argc, char *argv[]) {
+    // 解析命令行：./fp8_server [N] 只运行实验 N
+    int only_exp = 0;
+    if (argc >= 2) only_exp = atoi(argv[1]);
+
     std::cout << "\n" << std::string(70, '#') << "\n";
     std::cout << "  FP8 查表法矩阵乘法 — 服务器性能测试\n";
     std::cout << "  平台: HiSilicon Kunpeng, SVE\n";
@@ -1038,13 +1042,15 @@ int main() {
     std::cout << "\n参考结果 C[0][0] = " << C_ref[0] << "\n";
 
     // 实验1: SVE 加速比 (1 核)
-    exp1_sve_speedup(LUT.data(), A.data(), B_T.data(), N1, S1, L1);
+    if (!only_exp || only_exp == 1)
+        exp1_sve_speedup(LUT.data(), A.data(), B_T.data(), N1, S1, L1);
 
     // 实验2: Tile 扫描 (SVE, 80 核 = 1 NUMA node)
-    exp2_tile_sweep(LUT.data(), A.data(), B_T.data(), C_ref.data(), N1, S1, L1, 80);
+    if (!only_exp || only_exp == 2)
+        exp2_tile_sweep(LUT.data(), A.data(), B_T.data(), C_ref.data(), N1, S1, L1, 80);
 
     // 实验3: NUMA node 内多核扩展 (SVE, 使用首节点 CPU)
-    {
+    if (!only_exp || only_exp == 3) {
         int numa_node = 0;
         auto cpus = cpus_on_node(numa_node);
         std::cout << "  Node " << numa_node << " CPUs: " << cpus.size() << " 个 ("
@@ -1054,16 +1060,19 @@ int main() {
     }
 
     // 实验6: L1 分组建表查表试验 (80 核, SVE)
-    exp6_l1_grouped_lut(LUT.data(), A.data(), B_T.data(), C_ref.data(),
-                        N1, S1, L1, 80);
+    if (!only_exp || only_exp == 6)
+        exp6_l1_grouped_lut(LUT.data(), A.data(), B_T.data(), C_ref.data(),
+                            N1, S1, L1, 80);
 
     // ========= 大矩阵实验 (跨 NUMA + Cache 边界) =========
 
     // 实验4: 跨 NUMA 扩展 (用固定矩阵测试 1~320 核)
-    exp4_cross_numa(LUT.data(), 512, 2048, 512);
+    if (!only_exp || only_exp == 4)
+        exp4_cross_numa(LUT.data(), 512, 2048, 512);
 
     // 实验5: 矩阵规模扩展 (80 核, 对比 tile 效果)
-    exp5_matrix_scaling(LUT.data());
+    if (!only_exp || only_exp == 5)
+        exp5_matrix_scaling(LUT.data());
 
     std::cout << "\n测试完成!\n";
     return 0;
