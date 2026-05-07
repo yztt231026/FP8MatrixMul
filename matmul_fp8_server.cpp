@@ -57,8 +57,6 @@ const char* cache_level(int workset_kib, int L1d, int L2) {
     return "L3+";
 }
 
-}
-
 // ====================== 计算核心 ======================
 
 // ---- 标量版（串行基线） ----
@@ -142,7 +140,15 @@ bool verify(const float *ref, const float *result, int n, float tol = 1e-3f) {
     for (int i = 0; i < n; i++)
         if (fabsf(ref[i] - result[i]) > tol) return false;
     return true;
+}
 
+/** Linux perf_event_open 封装，用于采集 ARM PMU 硬件事件 */
+class PerfCounter {
+    int fd_ = -1;
+
+    static long sys_open(struct perf_event_attr *pea, pid_t pid, int cpu,
+                         int group_fd, unsigned long flags) {
+        return syscall(__NR_perf_event_open, pea, pid, cpu, group_fd, flags);
     }
 
 public:
