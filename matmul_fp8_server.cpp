@@ -17,6 +17,7 @@
 #include <omp.h>
 #include <sstream>
 #include <functional>
+#include <algorithm>
 #include <unistd.h>
 #include <numa.h>
 
@@ -604,6 +605,238 @@ void exp5_matrix_scaling(const float *table) {
     }
 }
 
+// ====================== 实验6：L1 分组建表查表 ======================
+
+/** 预处理：为每行 A 构建组索引 */
+struct GroupData {
+    int G, step;
+    int total_elements;
+    std::vector<int> row_start;     // [N*G]
+    std::vector<int> row_count;     // [N*G]
+    std::vector<uint8_t> A_grouped;
+    std::vector<int> k_indices;
+};
+
+static GroupData preprocess_groups(const uint8_t *A, int N, int L, int G) {
+    GroupData d;
+    d.G = G; d.step = 256 / G;
+    d.row_start.assign(N * G, 0);
+    d.row_count.assign(N * G, 0);
+
+    for (int i = 0; i < N; ++i)
+        for (int k = 0; k < L; ++k)
+            d.row_count[i * G + A[i * L + k] / d.step]++;
+
+    d.total_elements = 0;
+    for (int i = 0; i < N; ++i)
+        for (int g = 0; g < G; ++g) {
+            d.row_start[i * G + g] = d.total_elements;
+            d.total_elements += d.row_count[i * G + g];
+        }
+
+    d.A_grouped.resize(d.total_elements);
+    d.k_indices.resize(d.total_elements);
+    std::vector<int> cursor(N * G, 0);
+    for (int i = 0; i < N; ++i)
+        for (int k = 0; k < L; ++k) {
+            int g = A[i * L + k] / d.step;
+            int pos = d.row_start[i * G + g] + cursor[i * G + g];
+            d.A_grouped[pos] = A[i * L + k];
+            d.k_indices[pos] = k;
+            cursor[i * G + g]++;
+        }
+    return d;
+}
+
+/** 从完整 LUT 切出 G 个子表（float） */
+static void build_subtables(int G, std::vector<std::vector<float>> &subtables,
+                            const float *lut) {
+    int step = 256 / G;
+    subtables.resize(G);
+    for (int g = 0; g < G; ++g) {
+        subtables[g].resize(step * 256);
+        for (int a = 0; a < step; ++a)
+            for (int b = 0; b < 256; ++b)
+                subtables[g][a * 256 + b] = lut[(g * step + a) * 256 + b];
+    }
+}
+
+/** G 核 SVE 分组建表查表：
+    每核持一个子表，阶段1标量收集B_T，阶段2 SVE向量化查子表(L1) */
+void lookup_sve_grouped_omp(const GroupData &data,
+                            const std::vector<std::vector<float>> &subtables,
+                            const uint8_t *B_T, float *C,
+                            int N, int S, int L,
+                            float *core_times, float &sync_time) {
+    int G = data.G, step = data.step;
+
+    #pragma omp parallel num_threads(G)
+    {
+        int g = omp_get_thread_num();
+        const float *sub = subtables[g].data();
+        int base = g * step;
+
+        double t0 = omp_get_wtime();
+
+        for (int i = 0; i < N; ++i) {
+            int start = data.row_start[i * G + g];
+            int count = data.row_count[i * G + g];
+            const uint8_t *a_ptr = data.A_grouped.data() + start;
+            const int *k_ptr = data.k_indices.data() + start;
+
+            for (int j = 0; j < S; ++j) {
+                const uint8_t *b_row = B_T + j * L;
+
+                // 阶段1: 收集 B_T 值（标量按 k 索引随机加载）
+                alignas(16) uint8_t b_local[512];
+                for (int t = 0; t < count; ++t)
+                    b_local[t] = b_row[k_ptr[t]];
+
+                // 阶段2: SVE 向量化查子表（全部 L1 命中）
+                svfloat32_t acc = svdup_n_f32(0.0f);
+                int t = 0;
+                svbool_t pg = svwhilelt_b32(t, count);
+                while (svptest_any(svptrue_b32(), pg)) {
+                    svuint32_t a_vals = svld1ub_u32(pg, a_ptr + t);
+                    svuint32_t b_vals = svld1ub_u32(pg, b_local + t);
+                    svuint32_t idx = svorr_u32_z(pg,
+                        svlsl_n_u32_z(pg, svsub_u32_z(pg, a_vals, base), 8),
+                        b_vals);
+                    acc = svadd_f32_z(pg, acc,
+                        svld1_gather_u32index_f32(pg, sub, idx));
+                    t += svcntw();
+                    pg = svwhilelt_b32(t, count);
+                }
+
+                #pragma omp atomic
+                C[i * S + j] += svaddv_f32(svptrue_b32(), acc);
+            }
+        }
+
+        double t1 = omp_get_wtime();
+        core_times[g] = (t1 - t0) * 1e6;
+
+        #pragma omp barrier
+        #pragma omp master
+        sync_time = (omp_get_wtime() - t1) * 1e6;
+    }
+}
+
+void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
+                          const uint8_t *B_T, const float *ref,
+                          int N, int S, int L, int num_threads) {
+    std::cout << "\n" << std::string(70, '=') << "\n";
+    std::cout << "实验6: L1 分组建表查表试验 (SVE, " << num_threads << " 核)\n";
+    std::cout << std::string(70, '=') << "\n";
+    std::cout << "矩阵: " << N << "×" << L << " * " << S << "×" << L << "^T\n";
+    std::cout << "L1d = " << L1D_KiB << " KiB, 子表格式: float (4B)\n\n";
+
+    auto gops = [&](double us) { return double(N) * S * L / us / 1e3; };
+
+    // 基线：SVE + OpenMP 无分组
+    omp_set_num_threads(num_threads);
+    std::vector<float> C_bl(N * S);
+    double base_us = bench([&]() {
+        memset(C_bl.data(), 0, N * S * sizeof(float));
+        lookup_sve_omp(table, A, B_T, C_bl.data(), N, S, L);
+    });
+
+    bool base_ok = verify(ref, C_bl.data(), N * S);
+
+    std::cout << std::left
+              << std::setw(10) << "方案"
+              << std::setw(8) << "线程"
+              << std::setw(14) << "子表"
+              << std::setw(8) << "级别"
+              << std::setw(18) << "计算(核min~max)"
+              << std::setw(12) << "同步"
+              << std::setw(14) << "总耗时(us)"
+              << std::setw(10) << "GOP/s"
+              << std::setw(10) << "正确"
+              << "\n" << std::string(115, '-') << "\n";
+
+    std::cout << std::left
+              << std::setw(10) << "基线SVE"
+              << std::setw(8) << num_threads
+              << std::setw(14) << "256 KiB"
+              << std::setw(8) << "L2"
+              << std::setw(18) << "—"
+              << std::setw(12) << "—"
+              << std::setw(14) << std::fixed << std::setprecision(1) << base_us
+              << std::setw(10) << std::fixed << std::setprecision(2) << gops(base_us)
+              << std::setw(10) << (base_ok ? "OK" : "FAIL") << "\n";
+
+    // G 值扫描：G=1 相当于单核分组查参考，G≥4 子表 ≤64K 尝试 L1 驻留
+    int g_vals[] = {1, 2, 4, 8, 16, 32, 64};
+
+    for (int Gi : g_vals) {
+        if (Gi > omp_get_max_threads()) continue;
+        if (Gi > N * S) continue;  // 至少每个线程一个元素
+
+        GroupData gd = preprocess_groups(A, N, L, Gi);
+        std::vector<std::vector<float>> subs;
+        build_subtables(Gi, subs, table);
+
+        int sub_kib = (256 / Gi) * 256 * 4 / 1024;
+        const char *cl = cache_level(sub_kib, L1D_KiB, L2_KiB);
+
+        std::vector<float> C_g(N * S, 0);
+        std::vector<float> core_t(Gi);
+        float sync_t = 0;
+
+        // warmup 1 次
+        lookup_sve_grouped_omp(gd, subs, B_T, C_g.data(), N, S, L,
+                                core_t.data(), sync_t);
+
+        // 正式测量（多次取最优总耗时）
+        double best_total = 1e18;
+        float best_sync = 0;
+        std::vector<float> best_core(Gi);
+        for (int run = 0; run < 3; ++run) {
+            std::fill(C_g.begin(), C_g.end(), 0);
+            std::fill(core_t.begin(), core_t.end(), 0);
+            sync_t = 0;
+
+            lookup_sve_grouped_omp(gd, subs, B_T, C_g.data(), N, S, L,
+                                    core_t.data(), sync_t);
+
+            double total = *std::max_element(core_t.begin(), core_t.end()) + sync_t;
+            if (total < best_total) {
+                best_total = total;
+                best_sync = sync_t;
+                best_core = core_t;
+            }
+        }
+
+        float cmin = *std::min_element(best_core.begin(), best_core.end());
+        float cmax = *std::max_element(best_core.begin(), best_core.end());
+        double gops_v = gops(best_total);
+
+        std::ostringstream ss_sub;
+        if (sub_kib < 1024)
+            ss_sub << sub_kib << " KiB";
+        else
+            ss_sub << std::fixed << std::setprecision(1) << (sub_kib / 1024.0) << " MiB";
+
+        bool ok = verify(ref, C_g.data(), N * S);
+
+        std::ostringstream ss_comp;
+        ss_comp << std::fixed << std::setprecision(1) << cmin << "~" << cmax;
+
+        std::cout << std::left
+                  << std::setw(10) << ("G=" + std::to_string(Gi)).c_str()
+                  << std::setw(8) << Gi
+                  << std::setw(14) << ss_sub.str()
+                  << std::setw(8) << cl
+                  << std::setw(18) << ss_comp.str()
+                  << std::setw(12) << std::fixed << std::setprecision(1) << best_sync
+                  << std::setw(14) << std::fixed << std::setprecision(1) << best_total
+                  << std::setw(10) << std::fixed << std::setprecision(2) << gops_v
+                  << std::setw(10) << (ok ? "OK" : "FAIL") << "\n";
+    }
+    std::cout << "\n";
+}
+
 // ====================== Main ======================
 
 int main() {
@@ -618,8 +851,8 @@ int main() {
 
     srand(42);
 
-    // ========= 小矩阵实验 (全部在 L2 内，验证 SVE 和 Tiling 基础效果) =========
-    const int N1 = 256, S1 = 1024, L1 = 512;
+    // ========= 小矩阵实验 (与 x86 平台对比，验证 SVE / Tiling / L1 分组) =========
+    const int N1 = 128, S1 = 328, L1 = 512;
 
     std::vector<uint8_t> A(N1 * L1), B_T(S1 * L1);
     std::vector<float> LUT(LUT_SIZE);
@@ -648,6 +881,10 @@ int main() {
         exp3_numa_scaling(LUT.data(), A.data(), B_T.data(), C_ref.data(),
                          N1, S1, L1, numa_node, cpus);
     }
+
+    // 实验6: L1 分组建表查表试验 (80 核, SVE)
+    exp6_l1_grouped_lut(LUT.data(), A.data(), B_T.data(), C_ref.data(),
+                        N1, S1, L1, 80);
 
     // ========= 大矩阵实验 (跨 NUMA + Cache 边界) =========
 

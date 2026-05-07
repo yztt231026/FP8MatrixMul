@@ -259,6 +259,52 @@ Scale  工作集    Cache    Threads  Tiling    Time(us)   GOP/s
 
 ---
 
+### 3.4 实验4：L1 分组建表查表
+
+**目的：** 将 LUT 按 idxA 范围切成 G 个子表，G 个核协作计算同一个 (i,j)，每个核用自己独占的子表尝试在 L1 中完成查表，验证 L1 vs L2 的访存延迟差异。
+
+**代码：** `experiment_l1_grouped_lut()` + `lookup_scalar_grouped_omp()`
+
+**核函数原理（`lookup_scalar_grouped_omp`）**：对每个 C[i][j]，G 个 OpenMP 线程各分配一个子表，各自扫描自己组内的 k 索引累加部分和，最后用 `#pragma omp atomic` 合并到 C[i][j]。
+
+**预处理：** 对 A 的每一行，将 k 索引按 idxA 所属组重排，每组内 k 连续存储。总内存开销 N×L×2 字节 = 128 KiB。
+
+**输入：** 矩阵 128×512, S=328, L=512，与实验 1/2 一致
+
+**测试的 G 值及子表情况（float 存储）：**
+
+| G | 子表大小 | Cache 层级 | 说明 |
+|---|---------|-----------|------|
+| 1 | 256 KiB | L2 | 完整 LUT，当作基线比照 |
+| 2 | 128 KiB | L2 | 减半但仍 > L1d(48K) |
+| 4 | 64 KiB | **L2** | 仍 > 48K，部分缓存行竞争 |
+| 8 | **32 KiB** | **L1** | < 48K，完全 L1 驻留 ✅ |
+
+**输出：**
+
+```
+方案    线程  子表        级别  计算(核min~max) 同步    总耗时  GOP/s   正确
+基线OMP 10    256 KiB     L3    —               —      1964.5  10.94   OK
+G=1      1    256 KiB     L2    10618(单核)        2   10620    2.02   OK
+G=2      2    128 KiB     L2    5544~5617          1    5618    3.83   OK
+G=4      4     64 KiB     L2    2931~3033          1    3033    7.09   OK
+G=8      8     32 KiB     L1    1601~2227        361    2588    8.31   OK
+```
+
+**分析：**
+
+1. **计算时间随 G 增加接近线性缩减：** 单核 10618 μs → G=8 的 min 1601 μs（6.6×）。L1 子表（32 KiB）比 L2 完整表（256 KiB）的查表延迟确实更低。
+
+2. **G=8 同步时间暴增至 361 μs（14%）：** 根本原因是 8 个核同时对同一个 C[i][j] 做 `#pragma omp atomic`，触发 MESI 缓存一致性协议的频繁缓存行 ownership 传递。G≤4 时竞争不明显（同步 1 μs），G=8 开始显著。
+
+3. **负载不均：** G=8 的 compute 范围 1601~2227 μs，最慢核比最快核慢 39%，因为随机数据分布导致各组 k 元素数不均匀。
+
+4. **总 GOP/s 仍低于基线（8.31 vs 10.94）：** 虽然计算快了，但 atomic 开销 + 负载不均抵消了 L1 查表的收益。传统的行并行（各核写不同 C[i][j]）在 x86 这样的少数核平台上更优。
+
+**推论：** L1 分组的思路正确（查表延迟降低），瓶颈在核间同步。鲲鹏平台（80 核/Node）可能因更大的 L1d（64K，G=2 即可 L1 驻留）和不同的缓存一致性协议有不同表现。需要实际测试。
+
+---
+
 ## 4. 总结
 
 ### 4.1 优化收益
@@ -277,7 +323,7 @@ Scale  工作集    Cache    Threads  Tiling    Time(us)   GOP/s
 
 3. **LUT 本身的优化方向**（进一步突破）：
    - 将 LUT 从 float 降为 `__fp16`（128 KiB）—— 仍 > L1d 但 L2 压力减半
-   - 两级查表：先粗查再精调
+   - **L1 分组建表**（实验4）：将 LUT 切分为 G 个子表，每个子表可在单核 L1 常驻，查表延迟从 L2 降到 L1。x86 上 G=8 计算加速 6.6×，但 atomic 同步开销抵消了部分收益。此方案在核数更多、L1d 更大的平台（如鲲鹏 64K L1d）上可能有更好表现
    - 硬件原生 FP8 乘加指令（如果 CPU 支持）
 
 4. **跨架构适用性**：本文所有 cache 优化原理同样适用于 ARM SVE 或 GPU 平台 —— 只需将标量内循环替换为对应的向量化指令（如 SVE gather）。
@@ -304,7 +350,8 @@ matmul_fp8_lookup_test.cpp
 ├── 计算核心
 │   ├── lookup_scalar()        — 标量版（串行基线）
 │   ├── lookup_scalar_omp()    — OpenMP 行并行
-│   └── lookup_scalar_tiled_omp() — 分块 + OpenMP
+│   ├── lookup_scalar_tiled_omp() — 分块 + OpenMP
+│   └── lookup_scalar_grouped_omp() — L1 分组建表 + OpenMP（实验4）
 ├── Cache 分析工具
 │   ├── calc_tile_workset_kib()
 │   ├── cache_level()
@@ -312,7 +359,11 @@ matmul_fp8_lookup_test.cpp
 ├── 实验函数
 │   ├── experiment_thread_scaling()
 │   ├── experiment_tile_sweep()
-│   └── experiment_matrix_scaling()
+│   ├── experiment_matrix_scaling()
+│   └── experiment_l1_grouped_lut()  ← L1 分组建表实验
+├── 预处理工具（L1 分组）
+│   ├── preprocess_groups()    — 按 idxA 建组索引
+│   └── build_subtables()      — 切分子表
 └── main()
 ```
 
