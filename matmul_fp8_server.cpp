@@ -1200,15 +1200,16 @@ void exp10_pure_lookup_microbench(int n_lookups_user = 0) {
               << std::setw(16) << "标量vs实验7"
               << "\n" << std::string(156, '-') << "\n";
 
-    alignas(64) float local_vals[MAX_LOOKUPS];
-    alignas(64) uint32_t indices[MAX_LOOKUPS];  // 预计算索引
-
     for (int table_a : TABLE_A_VALS) {
         int entries = table_a * TABLE_B;
         int kib = entries * 4 / 1024;   // float 4B/entry
         // 用户指定 n_lookups 则使用用户值，否则按实验7规则
         int n_lookups = (n_lookups_user > 0) ? n_lookups_user
                                              : (MAX_LOOKUPS / (table_a / 2));
+
+        // 动态分配（用户可传入任意长度）
+        std::vector<float> local_vals(n_lookups);
+        std::vector<uint32_t> indices(n_lookups);
 
         // 构建 float 表
         std::vector<float> sub(entries);
@@ -1230,7 +1231,7 @@ void exp10_pure_lookup_microbench(int n_lookups_user = 0) {
             int t = 0;
             svbool_t pg = svwhilelt_b32(t, n_lookups);
             while (svptest_any(svptrue_b32(), pg)) {
-                acc = svadd_f32_m(pg, acc, svld1_f32(pg, local_vals + t));
+                acc = svadd_f32_m(pg, acc, svld1_f32(pg, local_vals.data() + t));
                 t += svcntw();
                 pg = svwhilelt_b32(t, n_lookups);
             }
@@ -1261,7 +1262,7 @@ void exp10_pure_lookup_microbench(int n_lookups_user = 0) {
             int t = 0;
             svbool_t pg = svwhilelt_b32(t, n_lookups);
             while (svptest_any(svptrue_b32(), pg)) {
-                acc = svadd_f32_m(pg, acc, svld1_f32(pg, local_vals + t));
+                acc = svadd_f32_m(pg, acc, svld1_f32(pg, local_vals.data() + t));
                 t += svcntw();
                 pg = svwhilelt_b32(t, n_lookups);
             }
@@ -1328,6 +1329,186 @@ void exp10_pure_lookup_microbench(int n_lookups_user = 0) {
 }
 
 
+// ====================== 实验11：SVE gather 查表微基准（预计算索引） ======================
+
+/**
+ * 实验11：在实验10的基础上，将标量查表替换为 SVE gather 查表。
+ *
+ * 与实验10的区别：
+ *   实验10标量相位： local_vals[i] = sub[indices[i]]              （标量逐元素）
+ *   实验11标量相位： SVE gather → svst1 写入 local_vals            （向量化 gather）
+ *
+ * Phase 1 直接对比可测得 SVE gather 相对标量加载的加速效果。
+ */
+void exp11_sve_gather_microbench(int n_lookups_user = 0) {
+    std::cout << "\n" << std::string(70, '=') << "\n";
+    std::cout << "实验11: SVE gather 查表微基准 — 预计算索引\n";
+    std::cout << std::string(70, '=') << "\n";
+    std::cout << "数据格式: float (4B/entry), SVE gather 查表 (svld1_gather_u32index_f32)\n";
+    std::cout << "与实验10区别: 标量逐元素查表 → SVE gather 向量化查表\n";
+    std::cout << "对比实验10的标量相位即可测得 SVE gather 相对标量加载的加速比\n\n";
+
+    constexpr int TABLE_B = 256;
+    constexpr int MAX_LOOKUPS = 128;
+    constexpr int TABLE_A_VALS[] = {2, 4, 8, 16, 32};
+    constexpr int WARMUP = 2000;
+    constexpr int ITERS = 20000;
+
+    // 输出表头（与实验10格式一致，"标量" → "SVE gather"）
+    std::cout << std::left
+              << std::setw(16) << "表维度"
+              << std::setw(14) << "表大小(KiB)"
+              << std::setw(14) << "查表次数"
+              << std::setw(16) << "平均耗时(μs)"
+              << std::setw(14) << "总查表(ns)"
+              << std::setw(14) << "每次查表(ns)"
+              << std::setw(14) << "L1-miss%"
+              << std::setw(14) << "SVE gather(μs)"
+              << std::setw(14) << "SVE累加(μs)"
+              << std::setw(14) << "归约(μs)"
+              << std::setw(16) << "vs实验10标量"
+              << "\n" << std::string(156, '-') << "\n";
+
+    for (int table_a : TABLE_A_VALS) {
+        int entries = table_a * TABLE_B;
+        int kib = entries * 4 / 1024;
+        int n_lookups = (n_lookups_user > 0) ? n_lookups_user
+                                             : (MAX_LOOKUPS / (table_a / 2));
+
+        // 构建 float 表
+        std::vector<float> sub(entries);
+        for (int a = 0; a < table_a; ++a)
+            for (int b = 0; b < TABLE_B; ++b)
+                sub[a * TABLE_B + b] = sinf(a * 0.1f) * cosf(b * 0.1f);
+
+        // 预计算索引
+        std::vector<uint32_t> indices(n_lookups);
+        for (int i = 0; i < n_lookups; ++i)
+            indices[i] = rand() % entries;
+
+        // local_vals 供 Phase 2 (SVE累加) 使用，与实验10结构一致
+        std::vector<float> local_vals(n_lookups);
+
+        volatile float sink = 0;
+
+        // Warmup
+        for (int w = 0; w < WARMUP; ++w) {
+            int t = 0;
+            svbool_t pg = svwhilelt_b32(t, n_lookups);
+            while (svptest_any(svptrue_b32(), pg)) {
+                svuint32_t idx_vec = svld1_u32(pg, indices.data() + t);
+                svfloat32_t gathered = svld1_gather_u32index_f32(pg, sub.data(), idx_vec);
+                svst1_f32(pg, local_vals.data() + t, gathered);
+                t += svcntw();
+                pg = svwhilelt_b32(t, n_lookups);
+            }
+            svfloat32_t acc = svdup_n_f32(0.0f);
+            t = 0;
+            pg = svwhilelt_b32(t, n_lookups);
+            while (svptest_any(svptrue_b32(), pg)) {
+                acc = svadd_f32_m(pg, acc, svld1_f32(pg, local_vals.data() + t));
+                t += svcntw();
+                pg = svwhilelt_b32(t, n_lookups);
+            }
+            sink = svaddv_f32(svptrue_b32(), acc);
+        }
+
+        // PMU 计数器
+        PerfCounter pc_l1_acc(ArmPmu::L1D_CACHE);
+        PerfCounter pc_l1_miss(ArmPmu::L1D_CACHE_REFILL);
+        bool perf_ok = pc_l1_acc.ok() && pc_l1_miss.ok();
+        if (perf_ok) {
+            pc_l1_acc.reset(); pc_l1_acc.enable();
+            pc_l1_miss.reset(); pc_l1_miss.enable();
+        }
+
+        // 正式测量：三阶段计时（与实验10结构一致）
+        double sum_total = 0, sum_gather = 0, sum_sve_acc = 0, sum_sve_reduce = 0;
+        for (int iter = 0; iter < ITERS; ++iter) {
+            auto t0 = high_resolution_clock::now();
+
+            // 阶段1: SVE gather 查表（替代实验10的标量逐元素加载）
+            int t = 0;
+            svbool_t pg = svwhilelt_b32(t, n_lookups);
+            while (svptest_any(svptrue_b32(), pg)) {
+                svuint32_t idx_vec = svld1_u32(pg, indices.data() + t);
+                svfloat32_t gathered = svld1_gather_u32index_f32(pg, sub.data(), idx_vec);
+                svst1_f32(pg, local_vals.data() + t, gathered);
+                t += svcntw();
+                pg = svwhilelt_b32(t, n_lookups);
+            }
+            auto t1 = high_resolution_clock::now();
+
+            // 阶段2: SVE 向量化累加
+            svfloat32_t acc = svdup_n_f32(0.0f);
+            t = 0;
+            pg = svwhilelt_b32(t, n_lookups);
+            while (svptest_any(svptrue_b32(), pg)) {
+                acc = svadd_f32_m(pg, acc, svld1_f32(pg, local_vals.data() + t));
+                t += svcntw();
+                pg = svwhilelt_b32(t, n_lookups);
+            }
+            auto t2 = high_resolution_clock::now();
+
+            // 阶段3: SVE 归约
+            sink = svaddv_f32(svptrue_b32(), acc);
+            auto t3 = high_resolution_clock::now();
+
+            sum_gather    += duration_cast<nanoseconds>(t1 - t0).count() / 1000.0;
+            sum_sve_acc   += duration_cast<nanoseconds>(t2 - t1).count() / 1000.0;
+            sum_sve_reduce += duration_cast<nanoseconds>(t3 - t2).count() / 1000.0;
+            sum_total     += duration_cast<nanoseconds>(t3 - t0).count() / 1000.0;
+        }
+
+        if (perf_ok) {
+            pc_l1_acc.disable();
+            pc_l1_miss.disable();
+        }
+
+        double avg_us = sum_total / ITERS;
+        double avg_ns_total = avg_us * 1000;
+        double avg_ns_each = avg_ns_total / n_lookups;
+        double avg_gather_us = sum_gather / ITERS;
+        double avg_sve_acc_us = sum_sve_acc / ITERS;
+        double avg_sve_reduce_us = sum_sve_reduce / ITERS;
+
+        // L1-miss%
+        std::string s_l1mr = "—";
+        if (perf_ok) {
+            uint64_t l1_a = pc_l1_acc.read();
+            uint64_t l1_m = pc_l1_miss.read();
+            if (l1_a > 0) {
+                double rate = 100.0 * l1_m / l1_a;
+                std::ostringstream ss;
+                ss << std::fixed << std::setprecision(2) << rate << "%";
+                s_l1mr = ss.str();
+            }
+        }
+
+        std::cout << std::left
+                  << std::setw(16) << (std::to_string(table_a) + "×256").c_str()
+                  << std::setw(14) << kib
+                  << std::setw(14) << n_lookups
+                  << std::setw(16) << std::fixed << std::setprecision(4) << avg_us
+                  << std::setw(14) << std::fixed << std::setprecision(2) << avg_ns_total
+                  << std::setw(14) << std::fixed << std::setprecision(2) << avg_ns_each
+                  << std::setw(14) << s_l1mr
+                  << std::setw(14) << std::fixed << std::setprecision(4) << avg_gather_us
+                  << std::setw(14) << std::fixed << std::setprecision(4) << avg_sve_acc_us
+                  << std::setw(14) << std::fixed << std::setprecision(4) << avg_sve_reduce_us
+                  << std::setw(16) << "—"  // 手动对比
+                  << "\n";
+    }
+    std::cout << std::string(156, '-') << "\n";
+    std::cout << "注: \"vs实验10标量\" 列需手动对比实验10输出。\n";
+    std::cout << "    实验11 Phase 1 = SVE gather 查表 | 实验10 Phase 1 = 标量逐元素查表\n";
+    std::cout << "    两者差值 = SVE gather 相对标量加载的加速/减速\n";
+    if (n_lookups_user > 0)
+        std::cout << "    使用外部传入的查表次数: " << n_lookups_user << "\n";
+    std::cout << "\n";
+}
+
+
 // ====================== Main ======================
 
 int main(int argc, char *argv[]) {
@@ -1386,6 +1567,14 @@ int main(int argc, char *argv[]) {
         int n_lookups = 0;
         if (argc >= 3) n_lookups = atoi(argv[2]);
         exp10_pure_lookup_microbench(n_lookups);
+    }
+
+    // 实验11: SVE gather 查表微基准（预计算索引）
+    // 用法：./fp8_server 11 [n_lookups]
+    if (!only_exp || only_exp == 11) {
+        int n_lookups = 0;
+        if (argc >= 3) n_lookups = atoi(argv[2]);
+        exp11_sve_gather_microbench(n_lookups);
     }
 
     std::cout << "\n测试完成!\n";
