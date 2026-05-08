@@ -1175,8 +1175,9 @@ void exp10_pure_lookup_microbench(int n_lookups_user = 0) {
     std::cout << "\n" << std::string(70, '=') << "\n";
     std::cout << "实验10: 纯查表微基准 — 预计算索引 (无索引计算开销)\n";
     std::cout << std::string(70, '=') << "\n";
-    std::cout << "与实验7区别: 索引预计算，标量相位仅含 BF16 查表 + 转 float\n";
-    std::cout << "对比实验7的标量相位即可测得索引计算 ((a)*256+(b)) 的开销\n\n";
+    std::cout << "数据格式: float (4B/entry), 无 BF16 转换\n";
+    std::cout << "与实验7区别: 索引预计算 + float 直接读取，标量相位仅含查表\n";
+    std::cout << "对比实验7的标量相位即可测得索引计算 ((a)*256+(b)) + BF16 转换的开销\n\n";
 
     constexpr int TABLE_B = 256;
     constexpr int MAX_LOOKUPS = 128;
@@ -1184,7 +1185,7 @@ void exp10_pure_lookup_microbench(int n_lookups_user = 0) {
     constexpr int WARMUP = 2000;
     constexpr int ITERS = 20000;
 
-    // 输出表头（与实验7格式一致，添加 "无索引计算" 标识）
+    // 输出表头（与实验7格式一致）
     std::cout << std::left
               << std::setw(16) << "表维度"
               << std::setw(14) << "表大小(KiB)"
@@ -1204,16 +1205,16 @@ void exp10_pure_lookup_microbench(int n_lookups_user = 0) {
 
     for (int table_a : TABLE_A_VALS) {
         int entries = table_a * TABLE_B;
-        int kib = entries * 2 / 1024;   // BF16 2B/entry
+        int kib = entries * 4 / 1024;   // float 4B/entry
         // 用户指定 n_lookups 则使用用户值，否则按实验7规则
         int n_lookups = (n_lookups_user > 0) ? n_lookups_user
                                              : (MAX_LOOKUPS / (table_a / 2));
 
-        // 构建 BF16 表
-        std::vector<uint16_t> sub(entries);
+        // 构建 float 表
+        std::vector<float> sub(entries);
         for (int a = 0; a < table_a; ++a)
             for (int b = 0; b < TABLE_B; ++b)
-                sub[a * TABLE_B + b] = float_to_bf16(sinf(a * 0.1f) * cosf(b * 0.1f));
+                sub[a * TABLE_B + b] = sinf(a * 0.1f) * cosf(b * 0.1f);
 
         // 预计算索引数组：indices[i] = rand() % entries
         for (int i = 0; i < n_lookups; ++i)
@@ -1223,10 +1224,8 @@ void exp10_pure_lookup_microbench(int n_lookups_user = 0) {
 
         // Warmup
         for (int w = 0; w < WARMUP; ++w) {
-            for (int i = 0; i < n_lookups; ++i) {
-                uint32_t bits = (uint32_t)sub[indices[i]] << 16;
-                memcpy(&local_vals[i], &bits, 4);
-            }
+            for (int i = 0; i < n_lookups; ++i)
+                local_vals[i] = sub[indices[i]];
             svfloat32_t acc = svdup_n_f32(0.0f);
             int t = 0;
             svbool_t pg = svwhilelt_b32(t, n_lookups);
@@ -1252,11 +1251,9 @@ void exp10_pure_lookup_microbench(int n_lookups_user = 0) {
         for (int iter = 0; iter < ITERS; ++iter) {
             auto t0 = high_resolution_clock::now();
 
-            // 阶段1: 纯查表（无索引计算）
-            for (int i = 0; i < n_lookups; ++i) {
-                uint32_t bits = (uint32_t)sub[indices[i]] << 16;
-                memcpy(&local_vals[i], &bits, 4);
-            }
+            // 阶段1: 纯查表（无索引计算，float 直接读取）
+            for (int i = 0; i < n_lookups; ++i)
+                local_vals[i] = sub[indices[i]];
             auto t1 = high_resolution_clock::now();
 
             // 阶段2: SVE 向量化累加
@@ -1321,8 +1318,8 @@ void exp10_pure_lookup_microbench(int n_lookups_user = 0) {
     }
     std::cout << std::string(156, '-') << "\n";
     std::cout << "注: \"标量vs实验7\" 列需手动对比实验7输出。\n";
-    std::cout << "    实验10标量相位 = 纯查表 | 实验7标量相位 = 查表 + 索引计算\n";
-    std::cout << "    两者差值 = 索引计算 (a*256+b) 的开销\n";
+    std::cout << "    实验10标量相位 = float 纯查表 | 实验7标量相位 = BF16 查表 + 索引计算 + BF16→float\n";
+    std::cout << "    两者差值 = 索引计算 (a*256+b) + BF16 转换开销\n";
 
     // 如有用户指定 n_lookups 参数，打印提示
     if (n_lookups_user > 0)
