@@ -1509,6 +1509,115 @@ void exp11_sve_gather_microbench(int n_lookups_user = 0) {
 }
 
 
+// ====================== 实验12：索引计算微基准 (uint8→uint32, (a<<8)+b) ======================
+
+/**
+ * 实验12：测试两种方式计算 C_i = (A_i << 8) + B_i 的性能。
+ *
+ * 标量: for 循环逐元素计算
+ * SVE: svld1ub_u32 字节加载 + svlsl + svadd + svst1_u32
+ *
+ * 此运算等价于 FP8 查表中 idx = idxA * 256 + idxB 的索引计算。
+ */
+void exp12_index_compute_microbench() {
+    std::cout << "\n" << std::string(70, '=') << "\n";
+    std::cout << "实验12: 索引计算微基准 (uint8→uint32, (a<<8)+b)\n";
+    std::cout << std::string(70, '=') << "\n";
+    std::cout << "测试标量 vs SVE 计算 C_i = (A_i << 8) + B_i, A_i/B_i ∈ uint8\n";
+    std::cout << "此运算等价于 idx = idxA * 256 + idxB 的索引计算\n\n";
+
+    constexpr int LENGTHS[] = {128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
+    constexpr int WARMUP = 2000;
+    constexpr int ITERS = 20000;
+    constexpr int MAX_LEN = 65536;
+
+    // 预生成随机数据
+    std::vector<uint8_t> A(MAX_LEN), B(MAX_LEN);
+    fill_random(A.data(), MAX_LEN);
+    fill_random(B.data(), MAX_LEN);
+
+    std::vector<uint32_t> C_scalar(MAX_LEN), C_sve(MAX_LEN);
+
+    std::cout << std::left
+              << std::setw(12) << "长度"
+              << std::setw(18) << "标量(μs)"
+              << std::setw(18) << "标量(ns/元素)"
+              << std::setw(18) << "SVE(μs)"
+              << std::setw(18) << "SVE(ns/元素)"
+              << std::setw(14) << "加速比"
+              << "\n" << std::string(100, '-') << "\n";
+
+    for (int N : LENGTHS) {
+        // ——— 标量版本 ———
+        auto scalar_fn = [&]() {
+            for (int i = 0; i < N; ++i)
+                C_scalar[i] = ((uint32_t)A[i] << 8) + B[i];
+        };
+
+        // Warmup
+        for (int w = 0; w < WARMUP; ++w) scalar_fn();
+
+        // 正式测量标量
+        double t_scalar = 0;
+        for (int iter = 0; iter < ITERS; ++iter) {
+            auto t0 = high_resolution_clock::now();
+            scalar_fn();
+            auto t1 = high_resolution_clock::now();
+            t_scalar += duration_cast<nanoseconds>(t1 - t0).count() / 1000.0;
+        }
+        t_scalar /= ITERS;
+
+        // ——— SVE 版本 ———
+        auto sve_fn = [&]() {
+            int i = 0;
+            svbool_t pg = svwhilelt_b32(i, N);
+            while (svptest_any(svptrue_b32(), pg)) {
+                svuint32_t a_vec = svld1ub_u32(pg, A.data() + i);
+                svuint32_t b_vec = svld1ub_u32(pg, B.data() + i);
+                svuint32_t c_vec = svadd_u32_z(pg,
+                    svmul_n_u32_z(pg, a_vec, 256), b_vec);
+                svst1_u32(pg, C_sve.data() + i, c_vec);
+                i += svcntw();
+                pg = svwhilelt_b32(i, N);
+            }
+        };
+
+        // Warmup
+        for (int w = 0; w < WARMUP; ++w) sve_fn();
+
+        // 正式测量 SVE
+        double t_sve = 0;
+        for (int iter = 0; iter < ITERS; ++iter) {
+            auto t0 = high_resolution_clock::now();
+            sve_fn();
+            auto t1 = high_resolution_clock::now();
+            t_sve += duration_cast<nanoseconds>(t1 - t0).count() / 1000.0;
+        }
+        t_sve /= ITERS;
+
+        // 验证正确性
+        bool ok = true;
+        for (int i = 0; i < N; ++i) {
+            if (C_scalar[i] != C_sve[i]) { ok = false; break; }
+        }
+
+        double speedup = t_scalar / t_sve;
+
+        std::cout << std::left
+                  << std::setw(12) << N
+                  << std::setw(18) << std::fixed << std::setprecision(3) << t_scalar
+                  << std::setw(18) << std::fixed << std::setprecision(3) << (t_scalar * 1000 / N)
+                  << std::setw(18) << std::fixed << std::setprecision(3) << t_sve
+                  << std::setw(18) << std::fixed << std::setprecision(3) << (t_sve * 1000 / N)
+                  << std::setw(14) << std::fixed << std::setprecision(2) << speedup << "×"
+                  << (ok ? "" : "  FAIL")
+                  << "\n";
+        }
+    }
+    std::cout << "\n";
+}
+
+
 // ====================== Main ======================
 
 int main(int argc, char *argv[]) {
@@ -1576,6 +1685,10 @@ int main(int argc, char *argv[]) {
         if (argc >= 3) n_lookups = atoi(argv[2]);
         exp11_sve_gather_microbench(n_lookups);
     }
+
+    // 实验12: 索引计算微基准 (uint8→uint32, (a<<8)+b)
+    if (!only_exp || only_exp == 12)
+        exp12_index_compute_microbench();
 
     std::cout << "\n测试完成!\n";
     return 0;
