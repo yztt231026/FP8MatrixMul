@@ -575,106 +575,106 @@ void exp7_single_core_l1_lookup() {
     std::cout << "实验7: 单核 L1 小表微基准 (SVE 归约)\n";
     std::cout << std::string(70, '=') << "\n";
 
-    constexpr int TABLE_A = 2;
     constexpr int TABLE_B = 256;
-    constexpr int TABLE_ENTRIES = TABLE_A * TABLE_B;  // 512 entries × 2B = 1 KiB
     constexpr int N_LOOKUPS = 128;
+    constexpr int TABLE_A_VALS[] = {2, 4, 8, 16, 32};
 
-    // 构建 BF16 小表（1 KiB，完全 L1 驻留）
-    std::vector<uint16_t> sub(TABLE_ENTRIES);
-    for (int a = 0; a < TABLE_A; ++a)
-        for (int b = 0; b < TABLE_B; ++b)
-            sub[a * TABLE_B + b] = float_to_bf16(sinf(a * 0.1f) * cosf(b * 0.1f));
+    // 测量 lambda：对给定表大小执行一次 benchmark（warmup + 采样），返回最小值
+    auto measure = [&](int table_a, const uint8_t *a_vals, const uint8_t *b_vals,
+                       const uint16_t *sub) -> double {
+        constexpr int WARMUP = 2000;
+        constexpr int ITERS = 20000;
 
-    // 生成 128 对 (a, b)，a ∈ [0,1], b ∈ [0,255]
-    std::vector<uint8_t> a_vals(N_LOOKUPS), b_vals(N_LOOKUPS);
-    fill_random(a_vals.data(), N_LOOKUPS);
-    for (auto &v : a_vals) v &= 1;  // clamp 到 [0,1]
-    fill_random(b_vals.data(), N_LOOKUPS);
+        volatile float sink = 0;
 
-    // BF16 标量参考结果
-    float ref_sum = 0;
-    for (int i = 0; i < N_LOOKUPS; ++i) {
-        int idx = a_vals[i] * TABLE_B + b_vals[i];
-        uint32_t bits = (uint32_t)sub[idx] << 16;
-        float v;
-        memcpy(&v, &bits, 4);
-        ref_sum += v;
+        // Warmup
+        for (int w = 0; w < WARMUP; ++w) {
+            alignas(64) float local_vals[N_LOOKUPS];
+            for (int i = 0; i < N_LOOKUPS; ++i) {
+                int idx = a_vals[i] * TABLE_B + b_vals[i];
+                uint32_t bits = (uint32_t)sub[idx] << 16;
+                memcpy(&local_vals[i], &bits, 4);
+            }
+            svfloat32_t acc = svdup_n_f32(0.0f);
+            int t = 0;
+            svbool_t pg = svwhilelt_b32(t, N_LOOKUPS);
+            while (svptest_any(svptrue_b32(), pg)) {
+                acc = svadd_f32_m(pg, acc, svld1_f32(pg, local_vals + t));
+                t += svcntw();
+                pg = svwhilelt_b32(t, N_LOOKUPS);
+            }
+            sink = svaddv_f32(svptrue_b32(), acc);
+        }
+
+        // 正式测量
+        double min_us = 1e18;
+        for (int iter = 0; iter < ITERS; ++iter) {
+            auto t0 = high_resolution_clock::now();
+
+            alignas(64) float local_vals[N_LOOKUPS];
+            for (int i = 0; i < N_LOOKUPS; ++i) {
+                int idx = a_vals[i] * TABLE_B + b_vals[i];
+                uint32_t bits = (uint32_t)sub[idx] << 16;
+                memcpy(&local_vals[i], &bits, 4);
+            }
+            svfloat32_t acc = svdup_n_f32(0.0f);
+            int t = 0;
+            svbool_t pg = svwhilelt_b32(t, N_LOOKUPS);
+            while (svptest_any(svptrue_b32(), pg)) {
+                acc = svadd_f32_m(pg, acc, svld1_f32(pg, local_vals + t));
+                t += svcntw();
+                pg = svwhilelt_b32(t, N_LOOKUPS);
+            }
+            sink = svaddv_f32(svptrue_b32(), acc);
+
+            auto t1 = high_resolution_clock::now();
+            double us = duration_cast<nanoseconds>(t1 - t0).count() / 1000.0;
+            if (us < min_us) min_us = us;
+        }
+        return min_us;
+    };
+
+    // 输出表头
+    std::cout << std::left
+              << std::setw(16) << "表维度"
+              << std::setw(14) << "表大小(entries)"
+              << std::setw(12) << "表大小(KiB)"
+              << std::setw(14) << "耗时min(μs)"
+              << std::setw(16) << "每次查表(ns)"
+              << std::setw(14) << "每次查表(cyc)"
+              << "\n" << std::string(85, '-') << "\n";
+
+    for (int table_a : TABLE_A_VALS) {
+        int entries = table_a * TABLE_B;
+        int kib = entries * 2 / 1024;  // BF16 2B/entry
+
+        // 构建 BF16 表
+        std::vector<uint16_t> sub(entries);
+        for (int a = 0; a < table_a; ++a)
+            for (int b = 0; b < TABLE_B; ++b)
+                sub[a * TABLE_B + b] = float_to_bf16(sinf(a * 0.1f) * cosf(b * 0.1f));
+
+        // 生成 128 对 (a, b)，a ∈ [0, table_a-1]
+        std::vector<uint8_t> a_vals(N_LOOKUPS), b_vals(N_LOOKUPS);
+        fill_random(a_vals.data(), N_LOOKUPS);
+        for (auto &v : a_vals) v %= table_a;
+        fill_random(b_vals.data(), N_LOOKUPS);
+
+        double min_us = measure(table_a, a_vals.data(), b_vals.data(), sub.data());
+
+        double ns_per_lookup = min_us / N_LOOKUPS * 1000;
+        int cyc_per_lookup = (int)(ns_per_lookup * 2.4);
+
+        std::cout << std::left
+                  << std::setw(16) << (std::to_string(table_a) + "×256").c_str()
+                  << std::setw(14) << entries
+                  << std::setw(12) << kib
+                  << std::setw(14) << std::fixed << std::setprecision(4) << min_us
+                  << std::setw(16) << std::fixed << std::setprecision(2) << ns_per_lookup
+                  << std::setw(14) << ("~" + std::to_string(cyc_per_lookup))
+                  << "\n";
     }
-
-    // SVE 版本：标量查表 + SVE 向量累加 + svaddv 归约
-    constexpr int WARMUP = 2000;
-    constexpr int ITERS = 20000;
-
-    double sum_us = 0, sum_us2 = 0;
-    double min_us = 1e18;
-    volatile float sink = 0;  // 防止编译器优化掉结果
-
-    // Warmup
-    for (int w = 0; w < WARMUP; ++w) {
-        alignas(64) float local_vals[N_LOOKUPS];
-        for (int i = 0; i < N_LOOKUPS; ++i) {
-            int idx = a_vals[i] * TABLE_B + b_vals[i];
-            uint32_t bits = (uint32_t)sub[idx] << 16;
-            memcpy(&local_vals[i], &bits, 4);
-        }
-        svfloat32_t acc = svdup_n_f32(0.0f);
-        int t = 0;
-        svbool_t pg = svwhilelt_b32(t, N_LOOKUPS);
-        while (svptest_any(svptrue_b32(), pg)) {
-            acc = svadd_f32_m(pg, acc, svld1_f32(pg, local_vals + t));
-            t += svcntw();
-            pg = svwhilelt_b32(t, N_LOOKUPS);
-        }
-        sink = svaddv_f32(svptrue_b32(), acc);
-    }
-
-    // 正式测量
-    for (int iter = 0; iter < ITERS; ++iter) {
-        auto t0 = high_resolution_clock::now();
-
-        alignas(64) float local_vals[N_LOOKUPS];
-        for (int i = 0; i < N_LOOKUPS; ++i) {
-            int idx = a_vals[i] * TABLE_B + b_vals[i];
-            uint32_t bits = (uint32_t)sub[idx] << 16;
-            memcpy(&local_vals[i], &bits, 4);
-        }
-        svfloat32_t acc = svdup_n_f32(0.0f);
-        int t = 0;
-        svbool_t pg = svwhilelt_b32(t, N_LOOKUPS);
-        while (svptest_any(svptrue_b32(), pg)) {
-            acc = svadd_f32_m(pg, acc, svld1_f32(pg, local_vals + t));
-            t += svcntw();
-            pg = svwhilelt_b32(t, N_LOOKUPS);
-        }
-        sink = svaddv_f32(svptrue_b32(), acc);
-
-        auto t1 = high_resolution_clock::now();
-        double us = duration_cast<nanoseconds>(t1 - t0).count() / 1000.0;
-        sum_us += us;
-        sum_us2 += us * us;
-        if (us < min_us) min_us = us;
-    }
-
-    double mean_us = sum_us / ITERS;
-    double var_us = (sum_us2 - sum_us * mean_us) / (ITERS - 1);
-    double sd_us = std::sqrt(std::max(0.0, var_us));
-
-    bool ok = std::abs(static_cast<double>(sink) - ref_sum) < 1e-3;
-
-    std::cout << std::fixed << std::setprecision(4);
-    std::cout << "表大小: 2×256 BF16 = 1 KiB → 完全 L1 驻留\n";
-    std::cout << "查表次数: " << N_LOOKUPS << "\n";
-    std::cout << "参考结果: " << ref_sum << "\n";
-    std::cout << "SVE 结果: " << (double)sink << "  " << (ok ? "OK" : "FAIL") << "\n";
-    std::cout << "                          (mean ± sd)     min\n";
-    std::cout << "耗时 (μs):               "
-              << std::setw(10) << mean_us << " ± " << std::setw(6) << sd_us << "  "
-              << std::setw(10) << min_us << "\n";
-    std::cout << "每次查表 (ns):           "
-              << std::setw(10) << (min_us / N_LOOKUPS * 1000) << "\n";
-    std::cout << "单次 L1 查表延迟 (cyc):  ≈ "
-              << (int)(min_us / N_LOOKUPS * 1000 * 2.4) << "  (@ 2.4 GHz)\n";
+    std::cout << std::string(85, '-') << "\n";
 }
 
 // ====================== Main ======================

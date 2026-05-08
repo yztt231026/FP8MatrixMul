@@ -7,7 +7,19 @@
       "Bash(git commit -m ' *)",
       "Bash(git push *)",
       "Bash(git commit *)",
-      "Bash(grep *)"
+      "Bash(grep *)",
+      "Bash(python3 *)",
+      "Bash(uv run *)",
+      "Bash(uv add *)",
+      "Bash(uv pip *)",
+      "Bash(fc-list :lang=zh)",
+      "Bash(fc-list)",
+      "Bash(g++ *)",
+      "Bash(git checkout *)",
+      "Bash(git rm *)",
+      "Bash(git status *)",
+      "Bash(ping -c 1 -W 2 github.com)",
+      "Bash(git remote *)"
     ]
   }
 }
