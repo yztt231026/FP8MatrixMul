@@ -1081,10 +1081,7 @@ void exp9_matrix_load_microbench() {
               << std::setw(16) << "平均耗时(μs)"
               << std::setw(14) << "每次查表(ns)"
               << std::setw(14) << "L1-miss%"
-              << std::setw(14) << "标量(μs)"
-              << std::setw(14) << "SVE累加(μs)"
-              << std::setw(14) << "归约(μs)"
-              << "\n" << std::string(145, '-') << "\n";
+              << "\n" << std::string(95, '-') << "\n";
 
     for (int ti = 0; ti < 5; ++ti) {
         int table_a = TABLE_A_VALS[ti];
@@ -1134,27 +1131,26 @@ void exp9_matrix_load_microbench() {
             pc_l1_miss.reset(); pc_l1_miss.enable();
         }
 
-        // 正式测量：三阶段计时
-        double sum_total = 0, sum_scalar = 0, sum_sve_acc = 0, sum_sve_rdc = 0;
+        // 正式测量：整体计时，仅统计平均耗时
+        double sum_total = 0;
 
         for (int iter = 0; iter < ITERS; ++iter) {
             std::fill(C.begin(), C.end(), 0);
 
+            auto t0 = high_resolution_clock::now();
             for (int i = 0; i < N; ++i) {
                 const uint8_t *a_row = A.data() + i * L;
                 for (int j = 0; j < S; ++j) {
                     const uint8_t *b_row = B_T.data() + j * L;
 
-                    double t0 = omp_get_wtime();
-                    // 阶段1: 标量 A/B 加载 + 子表查表 + BF16→float
+                    // 标量 A/B 加载 + 子表查表 + BF16→float
                     for (int k = 0; k < L; ++k) {
                         int idx = a_row[k] * TABLE_B + b_row[k];
                         uint32_t bits = (uint32_t)sub[idx] << 16;
                         memcpy(&local_vals[k], &bits, 4);
                     }
-                    double t1 = omp_get_wtime();
 
-                    // 阶段2: SVE 向量化累加
+                    // SVE 向量化累加 + 归约
                     svfloat32_t acc = svdup_n_f32(0.0f);
                     int t = 0;
                     svbool_t pg = svwhilelt_b32(t, L);
@@ -1163,18 +1159,12 @@ void exp9_matrix_load_microbench() {
                         t += svcntw();
                         pg = svwhilelt_b32(t, L);
                     }
-                    double t2 = omp_get_wtime();
-
-                    // 阶段3: SVE 归约 + 写 C
                     C[i * S + j] = svaddv_f32(svptrue_b32(), acc);
-                    double t3 = omp_get_wtime();
-
-                    sum_scalar += t1 - t0;
-                    sum_sve_acc += t2 - t1;
-                    sum_sve_rdc += t3 - t2;
-                    sum_total += t3 - t0;
                 }
             }
+            auto t1 = high_resolution_clock::now();
+
+            sum_total += duration_cast<nanoseconds>(t1 - t0).count() / 1000.0;
         }
 
         if (perf_ok) {
@@ -1182,18 +1172,9 @@ void exp9_matrix_load_microbench() {
             pc_l1_miss.disable();
         }
 
-        // 统计
-        double avg_total_us = sum_total / ITERS * 1e6;
-        double avg_scalar_us = sum_scalar / ITERS * 1e6;
-        double avg_sve_acc_us = sum_sve_acc / ITERS * 1e6;
-        double avg_sve_rdc_us = sum_sve_rdc / ITERS * 1e6;
+        double avg_total_us = sum_total / ITERS;
         double per_lookup_ns = avg_total_us * 1000 / total_lookups;
         exp9_per_lookup_ns[ti] = per_lookup_ns;
-
-        // 阶段占比
-        double pct_scalar = avg_scalar_us / avg_total_us * 100;
-        double pct_sve_acc = avg_sve_acc_us / avg_total_us * 100;
-        double pct_sve_rdc = avg_sve_rdc_us / avg_total_us * 100;
 
         // L1-miss%
         std::string s_l1mr = "—";
@@ -1215,19 +1196,9 @@ void exp9_matrix_load_microbench() {
                   << std::setw(16) << std::fixed << std::setprecision(1) << avg_total_us
                   << std::setw(14) << std::fixed << std::setprecision(2) << per_lookup_ns
                   << std::setw(14) << s_l1mr
-                  << std::setw(14) << std::fixed << std::setprecision(1) << avg_scalar_us
-                  << std::setw(14) << std::fixed << std::setprecision(1) << avg_sve_acc_us
-                  << std::setw(14) << std::fixed << std::setprecision(1) << avg_sve_rdc_us
-                  << "\n";
-
-        // 附加阶段占比
-        std::cout << std::string(15, ' ')
-                  << "  占比: 标量=" << std::fixed << std::setprecision(1) << pct_scalar << "%"
-                  << "  SVE累加=" << std::fixed << std::setprecision(1) << pct_sve_acc << "%"
-                  << "  归约=" << std::fixed << std::setprecision(1) << pct_sve_rdc << "%"
                   << "\n";
     }
-    std::cout << std::string(145, '-') << "\n";
+    std::cout << std::string(95, '-') << "\n";
 
     // === 与 exp7 对比 ===
     double exp7_per_lookup[] = {1.39, 1.97, 3.18, 5.93, 11.38};
