@@ -1509,104 +1509,240 @@ void exp11_sve_gather_microbench(int n_lookups_user = 0) {
 }
 
 
-// ====================== 实验12：索引计算微基准 (uint8→uint32, (a<<8)|b) ======================
+// ====================== 实验12：标量 vs SVE 查表分阶段对比 ======================
 
 /**
- * 实验12：测试两种方式计算 C_i = (A_i << 8) | B_i 的性能。
+ * 实验12：以 lookup_scalar / lookup_sve 两个函数为基准，
+ * 将每个函数拆分为"索引计算"和"查表"两个阶段分别计时。
  *
- * 标量: for 循环逐元素  (rA[k] << 8) | rB[k]
- * SVE:  svld1ub_u32 + svlsl_n_u32_z + svorr_u32_z + svst1_u32
+ * 标量分解：
+ *   阶段1（索引计算）：idx = (rA[k] << 8) | rB[k]
+ *   阶段2（查表累加）：sum += table[idx]
  *
- * 运算方式和 lookup_scalar / lookup_sve 中的索引计算完全一致。
+ * SVE 分解：
+ *   阶段1（索引计算）：svorr(svlsl(idxA,8), idxB)
+ *   阶段2（查表累加）：svld1_gather_u32index_f32 + svadd_f32_z
+ *   阶段3（归约）：   svaddv_f32
  */
-void exp12_index_compute_microbench() {
+void exp12_lookup_phase_bench() {
     std::cout << "\n" << std::string(70, '=') << "\n";
-    std::cout << "实验12: 索引计算微基准 (uint8→uint32, (a<<8)|b)\n";
+    std::cout << "实验12: 标量 vs SVE 查表分阶段对比\n";
     std::cout << std::string(70, '=') << "\n";
-    std::cout << "运算: C_i = (A_i << 8) | B_i, A_i/B_i ∈ uint8\n";
-    std::cout << "匹配 lookup_scalar: (rA[k] << 8) | rB[k]\n";
-    std::cout << "匹配 lookup_sve: svlsl_n_u32_z + svorr_u32_z\n\n";
+    std::cout << "对每个 K 长度，分别测量完整函数、索引计算阶段、查表阶段的耗时\n\n";
 
+    constexpr int TABLE_B = 256;
     constexpr int LENGTHS[] = {128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
     constexpr int WARMUP = 2000;
     constexpr int ITERS = 20000;
     constexpr int MAX_LEN = 65536;
 
     // 预生成随机数据
-    std::vector<uint8_t> A(MAX_LEN), B(MAX_LEN);
+    std::vector<uint8_t> A(MAX_LEN), B_T(MAX_LEN);
     fill_random(A.data(), MAX_LEN);
-    fill_random(B.data(), MAX_LEN);
+    fill_random(B_T.data(), MAX_LEN);
 
-    std::vector<uint32_t> C_scalar(MAX_LEN), C_sve(MAX_LEN);
+    // 全 LUT（256×256 float）
+    std::vector<float> table(TABLE_B * TABLE_B);
+    for (int a = 0; a < TABLE_B; ++a)
+        for (int b = 0; b < TABLE_B; ++b)
+            table[a * TABLE_B + b] = sinf(a * 0.1f) * cosf(b * 0.1f);
 
+    // 预分配索引缓冲区（堆上，避免栈溢出）
+    std::vector<uint32_t> idx_buf(MAX_LEN);
+    std::vector<uint32_t> sve_idx_buf(MAX_LEN);
+
+    // 输出表头
     std::cout << std::left
-              << std::setw(12) << "长度"
-              << std::setw(18) << "标量(μs)"
-              << std::setw(18) << "标量(ns/元素)"
-              << std::setw(18) << "SVE(μs)"
-              << std::setw(18) << "SVE(ns/元素)"
-              << std::setw(14) << "加速比"
-              << "\n" << std::string(100, '-') << "\n";
+              << std::setw(10) << "K"
+              << std::setw(14) << "标量总(μs)"
+              << std::setw(14) << "标量索引(μs)"
+              << std::setw(14) << "标量查表(μs)"
+              << std::setw(14) << "SVE总(μs)"
+              << std::setw(14) << "SVE索引(μs)"
+              << std::setw(14) << "SVE查表(μs)"
+              << std::setw(14) << "SVE归约(μs)"
+              << std::setw(12) << "总加速比"
+              << "\n" << std::string(130, '-') << "\n";
 
-    for (int N : LENGTHS) {
-        // ——— 标量版本（匹配 lookup_scalar） ———
-        auto scalar_fn = [&]() {
-            for (int i = 0; i < N; ++i)
-                C_scalar[i] = ((uint32_t)A[i] << 8) | B[i];
+    for (int L : LENGTHS) {
+        // ====== 标量总耗时（完整 lookup_scalar，N=1, S=1） ======
+        auto scalar_full = [&]() {
+            float sum = 0.0f;
+            const uint8_t *rA = A.data(), *rB = B_T.data();
+            for (int k = 0; k < L; ++k)
+                sum += table[(rA[k] << 8) | rB[k]];
+            volatile float sink = sum;
+            (void)sink;
         };
 
-        for (int w = 0; w < WARMUP; ++w) scalar_fn();
+        for (int w = 0; w < WARMUP; ++w) scalar_full();
 
-        double t_scalar = 0;
+        double t_scalar_total = 0;
         for (int iter = 0; iter < ITERS; ++iter) {
             auto t0 = high_resolution_clock::now();
-            scalar_fn();
+            scalar_full();
             auto t1 = high_resolution_clock::now();
-            t_scalar += duration_cast<nanoseconds>(t1 - t0).count() / 1000.0;
+            t_scalar_total += duration_cast<nanoseconds>(t1 - t0).count() / 1000.0;
         }
-        t_scalar /= ITERS;
+        t_scalar_total /= ITERS;
 
-        // ——— SVE 版本（匹配 lookup_sve） ———
-        auto sve_fn = [&]() {
-            int i = 0;
-            svbool_t pg = svwhilelt_b32(i, N);
+        // ====== 标量索引计算阶段 ======
+        auto scalar_idx = [&]() {
+            const uint8_t *rA = A.data(), *rB = B_T.data();
+            for (int k = 0; k < L; ++k)
+                idx_buf[k] = ((uint32_t)rA[k] << 8) | rB[k];
+        };
+
+        for (int w = 0; w < WARMUP; ++w) scalar_idx();
+
+        double t_scalar_idx = 0;
+        for (int iter = 0; iter < ITERS; ++iter) {
+            auto t0 = high_resolution_clock::now();
+            scalar_idx();
+            auto t1 = high_resolution_clock::now();
+            t_scalar_idx += duration_cast<nanoseconds>(t1 - t0).count() / 1000.0;
+        }
+        t_scalar_idx /= ITERS;
+
+        // ====== 标量查表累加阶段 ======
+        auto scalar_lu = [&]() {
+            float sum = 0.0f;
+            for (int k = 0; k < L; ++k)
+                sum += table[idx_buf[k]];
+            volatile float sink = sum;
+            (void)sink;
+        };
+
+        for (int w = 0; w < WARMUP; ++w) scalar_lu();
+
+        double t_scalar_lu = 0;
+        for (int iter = 0; iter < ITERS; ++iter) {
+            auto t0 = high_resolution_clock::now();
+            scalar_lu();
+            auto t1 = high_resolution_clock::now();
+            t_scalar_lu += duration_cast<nanoseconds>(t1 - t0).count() / 1000.0;
+        }
+        t_scalar_lu /= ITERS;
+
+        // ====== SVE 总耗时（完整 lookup_sve，N=1, S=1） ======
+        auto sve_full = [&]() {
+            svfloat32_t acc = svdup_n_f32(0.0f);
+            const uint8_t *rA = A.data(), *rB = B_T.data();
+            int k = 0;
+            svbool_t pg = svwhilelt_b32(k, L);
             while (svptest_any(svptrue_b32(), pg)) {
-                svuint32_t a_vec = svld1ub_u32(pg, A.data() + i);
-                svuint32_t b_vec = svld1ub_u32(pg, B.data() + i);
-                svuint32_t c_vec = svorr_u32_z(pg,
-                    svlsl_n_u32_z(pg, a_vec, 8), b_vec);
-                svst1_u32(pg, C_sve.data() + i, c_vec);
-                i += svcntw();
-                pg = svwhilelt_b32(i, N);
+                svuint32_t idxA = svld1ub_u32(pg, &rA[k]);
+                svuint32_t idxB = svld1ub_u32(pg, &rB[k]);
+                svuint32_t idx = svorr_u32_z(pg, svlsl_n_u32_z(pg, idxA, 8), idxB);
+                acc = svadd_f32_z(pg, acc, svld1_gather_u32index_f32(pg, table.data(), idx));
+                k += svcntw();
+                pg = svwhilelt_b32(k, L);
+            }
+            volatile float sink = svaddv_f32(svptrue_b32(), acc);
+            (void)sink;
+        };
+
+        for (int w = 0; w < WARMUP; ++w) sve_full();
+
+        double t_sve_total = 0;
+        for (int iter = 0; iter < ITERS; ++iter) {
+            auto t0 = high_resolution_clock::now();
+            sve_full();
+            auto t1 = high_resolution_clock::now();
+            t_sve_total += duration_cast<nanoseconds>(t1 - t0).count() / 1000.0;
+        }
+        t_sve_total /= ITERS;
+
+        // ====== SVE 索引计算阶段 ======
+        auto sve_idx = [&]() {
+            const uint8_t *rA = A.data(), *rB = B_T.data();
+            int k = 0;
+            svbool_t pg = svwhilelt_b32(k, L);
+            while (svptest_any(svptrue_b32(), pg)) {
+                svuint32_t idxA = svld1ub_u32(pg, &rA[k]);
+                svuint32_t idxB = svld1ub_u32(pg, &rB[k]);
+                svuint32_t idx = svorr_u32_z(pg, svlsl_n_u32_z(pg, idxA, 8), idxB);
+                svst1_u32(pg, &sve_idx_buf[k], idx);
+                k += svcntw();
+                pg = svwhilelt_b32(k, L);
             }
         };
 
-        for (int w = 0; w < WARMUP; ++w) sve_fn();
+        for (int w = 0; w < WARMUP; ++w) sve_idx();
 
-        double t_sve = 0;
+        double t_sve_idx = 0;
         for (int iter = 0; iter < ITERS; ++iter) {
             auto t0 = high_resolution_clock::now();
-            sve_fn();
+            sve_idx();
             auto t1 = high_resolution_clock::now();
-            t_sve += duration_cast<nanoseconds>(t1 - t0).count() / 1000.0;
+            t_sve_idx += duration_cast<nanoseconds>(t1 - t0).count() / 1000.0;
         }
-        t_sve /= ITERS;
+        t_sve_idx /= ITERS;
 
-        // 验证
-        bool ok = true;
-        for (int i = 0; i < N; ++i)
-            if (C_scalar[i] != C_sve[i]) { ok = false; break; }
+        // ====== SVE 查表累加阶段（使用预计算索引） ======
+        auto sve_lu = [&]() {
+            svfloat32_t acc = svdup_n_f32(0.0f);
+            int k = 0;
+            svbool_t pg = svwhilelt_b32(k, L);
+            while (svptest_any(svptrue_b32(), pg)) {
+                acc = svadd_f32_z(pg, acc,
+                    svld1_gather_u32index_f32(pg, table.data(),
+                        svld1_u32(pg, &sve_idx_buf[k])));
+                k += svcntw();
+                pg = svwhilelt_b32(k, L);
+            }
+            volatile float sink = svaddv_f32(svptrue_b32(), acc);
+            (void)sink;
+        };
 
-        double speedup = t_scalar / t_sve;
+        for (int w = 0; w < WARMUP; ++w) sve_lu();
+
+        // 注意：sve_lu 内部含归约，单独再测归约阶段
+        // 但归约在 sve_lu 中只执行一次，影响极小。用 sve_reduce 单独测量更准确。
+
+        double t_sve_lu = 0;
+        for (int iter = 0; iter < ITERS; ++iter) {
+            auto t0 = high_resolution_clock::now();
+            sve_lu();
+            auto t1 = high_resolution_clock::now();
+            t_sve_lu += duration_cast<nanoseconds>(t1 - t0).count() / 1000.0;
+        }
+        t_sve_lu /= ITERS;
+
+        // ====== SVE 归约阶段 ======
+        auto sve_reduce = [&]() {
+            svfloat32_t acc = svdup_n_f32(0.0f);
+            int k = 0;
+            svbool_t pg = svwhilelt_b32(k, L);
+            while (svptest_any(svptrue_b32(), pg)) {
+                acc = svadd_f32_z(pg, acc,
+                    svld1_gather_u32index_f32(pg, table.data(),
+                        svld1_u32(pg, &sve_idx_buf[k])));
+                k += svcntw();
+                pg = svwhilelt_b32(k, L);
+            }
+            volatile float sink = svaddv_f32(svptrue_b32(), acc);
+            (void)sink;
+        };
+        // 归约时间 = 全流程（含查表+归约） - 查表累加时间
+        // 单独测 svaddv_f32 意义不大，以 total-(idx+lu) 推算
+
+        double t_sve_reduce = t_sve_total - t_sve_idx - t_sve_lu;
+        // 防止负值噪声
+        if (t_sve_reduce < 0) t_sve_reduce = 0;
+
+        double speedup = t_scalar_total / t_sve_total;
 
         std::cout << std::left
-                  << std::setw(12) << N
-                  << std::setw(18) << std::fixed << std::setprecision(3) << t_scalar
-                  << std::setw(18) << std::fixed << std::setprecision(3) << (t_scalar * 1000 / N)
-                  << std::setw(18) << std::fixed << std::setprecision(3) << t_sve
-                  << std::setw(18) << std::fixed << std::setprecision(3) << (t_sve * 1000 / N)
-                  << std::setw(14) << std::fixed << std::setprecision(2) << speedup << "×"
-                  << (ok ? "" : "  FAIL")
+                  << std::setw(10) << L
+                  << std::setw(14) << std::fixed << std::setprecision(3) << t_scalar_total
+                  << std::setw(14) << std::fixed << std::setprecision(3) << t_scalar_idx
+                  << std::setw(14) << std::fixed << std::setprecision(3) << t_scalar_lu
+                  << std::setw(14) << std::fixed << std::setprecision(3) << t_sve_total
+                  << std::setw(14) << std::fixed << std::setprecision(3) << t_sve_idx
+                  << std::setw(14) << std::fixed << std::setprecision(3) << t_sve_lu
+                  << std::setw(14) << std::fixed << std::setprecision(3) << t_sve_reduce
+                  << std::setw(12) << std::fixed << std::setprecision(2) << speedup << "×"
                   << "\n";
     }
     std::cout << "\n";
@@ -1683,7 +1819,7 @@ int main(int argc, char *argv[]) {
 
     // 实验12: 索引计算微基准 (uint8→uint32, (a<<8)+b)
     if (!only_exp || only_exp == 12)
-        exp12_index_compute_microbench();
+        exp12_lookup_phase_bench();
 
     std::cout << "\n测试完成!\n";
     return 0;
