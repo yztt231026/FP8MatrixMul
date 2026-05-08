@@ -590,7 +590,10 @@ void exp7_single_core_l1_lookup() {
               << std::setw(14) << "总查表(ns)"
               << std::setw(14) << "每次查表(ns)"
               << std::setw(14) << "L1-miss%"
-              << "\n" << std::string(100, '-') << "\n";
+              << std::setw(14) << "标量(μs)"
+              << std::setw(14) << "SVE累加(μs)"
+              << std::setw(14) << "归约(μs)"
+              << "\n" << std::string(140, '-') << "\n";
 
     alignas(64) float local_vals[MAX_LOOKUPS];  // 预分配最大空间
 
@@ -640,16 +643,20 @@ void exp7_single_core_l1_lookup() {
             pc_l1_miss.reset(); pc_l1_miss.enable();
         }
 
-        // 正式测量：20000 次，计算平均时间
-        double sum_us = 0;
+        // 正式测量：20000 次，分阶段统计时间
+        double sum_total = 0, sum_scalar = 0, sum_sve_acc = 0, sum_sve_reduce = 0;
         for (int iter = 0; iter < ITERS; ++iter) {
             auto t0 = high_resolution_clock::now();
 
+            // 阶段1: 标量查表 + BF16→float
             for (int i = 0; i < n_lookups; ++i) {
                 int idx = a_vals[i] * TABLE_B + b_vals[i];
                 uint32_t bits = (uint32_t)sub[idx] << 16;
                 memcpy(&local_vals[i], &bits, 4);
             }
+            auto t1 = high_resolution_clock::now();
+
+            // 阶段2: SVE 向量化累加 (svadd_f32_m)
             svfloat32_t acc = svdup_n_f32(0.0f);
             int t = 0;
             svbool_t pg = svwhilelt_b32(t, n_lookups);
@@ -658,10 +665,16 @@ void exp7_single_core_l1_lookup() {
                 t += svcntw();
                 pg = svwhilelt_b32(t, n_lookups);
             }
-            sink = svaddv_f32(svptrue_b32(), acc);
+            auto t2 = high_resolution_clock::now();
 
-            auto t1 = high_resolution_clock::now();
-            sum_us += duration_cast<nanoseconds>(t1 - t0).count() / 1000.0;
+            // 阶段3: SVE 归约 (svaddv_f32)
+            sink = svaddv_f32(svptrue_b32(), acc);
+            auto t3 = high_resolution_clock::now();
+
+            sum_scalar   += duration_cast<nanoseconds>(t1 - t0).count() / 1000.0;
+            sum_sve_acc  += duration_cast<nanoseconds>(t2 - t1).count() / 1000.0;
+            sum_sve_reduce += duration_cast<nanoseconds>(t3 - t2).count() / 1000.0;
+            sum_total    += duration_cast<nanoseconds>(t3 - t0).count() / 1000.0;
         }
 
         if (perf_ok) {
@@ -669,9 +682,12 @@ void exp7_single_core_l1_lookup() {
             pc_l1_miss.disable();
         }
 
-        double avg_us = sum_us / ITERS;
-        double avg_ns_total = avg_us * 1000;     // 总查表时间 (ns)
-        double avg_ns_each = avg_ns_total / n_lookups;  // 每次查表 (ns)
+        double avg_us = sum_total / ITERS;
+        double avg_ns_total = avg_us * 1000;
+        double avg_ns_each = avg_ns_total / n_lookups;
+        double avg_scalar_us = sum_scalar / ITERS;
+        double avg_sve_acc_us = sum_sve_acc / ITERS;
+        double avg_sve_reduce_us = sum_sve_reduce / ITERS;
 
         // L1-miss%
         std::string s_l1mr = "—";
@@ -694,6 +710,9 @@ void exp7_single_core_l1_lookup() {
                   << std::setw(14) << std::fixed << std::setprecision(2) << avg_ns_total
                   << std::setw(14) << std::fixed << std::setprecision(2) << avg_ns_each
                   << std::setw(14) << s_l1mr
+                  << std::setw(14) << std::fixed << std::setprecision(4) << avg_scalar_us
+                  << std::setw(14) << std::fixed << std::setprecision(4) << avg_sve_acc_us
+                  << std::setw(14) << std::fixed << std::setprecision(4) << avg_sve_reduce_us
                   << "\n";
     }
     std::cout << std::string(100, '-') << "\n";
