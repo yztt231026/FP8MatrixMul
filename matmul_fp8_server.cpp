@@ -1612,7 +1612,6 @@ void exp12_index_compute_microbench() {
                   << std::setw(14) << std::fixed << std::setprecision(2) << speedup << "×"
                   << (ok ? "" : "  FAIL")
                   << "\n";
-        }
     }
     std::cout << "\n";
 }
