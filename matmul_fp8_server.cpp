@@ -1060,15 +1060,13 @@ void exp9_matrix_load_microbench() {
     std::cout << "查表次数/迭代: " << (int64_t)N * S * L << "\n";
     std::cout << "Warmup=" << WARMUP << ", 采样=" << ITERS << "\n\n";
 
-    // 生成矩阵
-    std::vector<uint8_t> A(N * L);
-    std::vector<uint8_t> B_T(S * L);
-    fill_random(A.data(), N * L);
-    fill_random(B_T.data(), S * L);
-
     // 完整 LUT（用于构建子表）
     std::vector<float> LUT(LUT_SIZE);
     gen_lut(LUT.data());
+
+    // B_T 矩阵（所有配置共用，idxB 值域 [0, 255]）
+    std::vector<uint8_t> B_T(S * L);
+    fill_random(B_T.data(), S * L);
 
     int64_t total_lookups = (int64_t)N * S * L;
 
@@ -1093,6 +1091,11 @@ void exp9_matrix_load_microbench() {
         int entries = table_a * TABLE_B;
         int kib = entries * 2 / 1024;
 
+        // 生成 A 矩阵，idxA 值约束到 [0, table_a-1]
+        std::vector<uint8_t> A(N * L);
+        for (size_t i = 0; i < A.size(); ++i)
+            A[i] = rand() % table_a;
+
         // 构建 BF16 子表
         std::vector<uint16_t> sub(entries);
         for (int a = 0; a < table_a; ++a)
@@ -1111,8 +1114,7 @@ void exp9_matrix_load_microbench() {
                     const uint8_t *b_row = B_T.data() + j * L;
                     float sum = 0.0f;
                     for (int k = 0; k < L; ++k) {
-                        int a_val = a_row[k] % table_a;
-                        int idx = a_val * TABLE_B + b_row[k];
+                        int idx = a_row[k] * TABLE_B + b_row[k];
                         uint32_t bits = (uint32_t)sub[idx] << 16;
                         float v;
                         memcpy(&v, &bits, 4);
@@ -1146,7 +1148,7 @@ void exp9_matrix_load_microbench() {
                     double t0 = omp_get_wtime();
                     // 阶段1: 标量 A/B 加载 + 子表查表 + BF16→float
                     for (int k = 0; k < L; ++k) {
-                        int a_val = a_row[k] % table_a;
+                        int idx = a_row[k] * TABLE_B + b_row[k];
                         int idx = a_val * TABLE_B + b_row[k];
                         uint32_t bits = (uint32_t)sub[idx] << 16;
                         memcpy(&local_vals[k], &bits, 4);
