@@ -1149,7 +1149,6 @@ void exp9_matrix_load_microbench() {
                     // 阶段1: 标量 A/B 加载 + 子表查表 + BF16→float
                     for (int k = 0; k < L; ++k) {
                         int idx = a_row[k] * TABLE_B + b_row[k];
-                        int idx = a_val * TABLE_B + b_row[k];
                         uint32_t bits = (uint32_t)sub[idx] << 16;
                         memcpy(&local_vals[k], &bits, 4);
                     }
