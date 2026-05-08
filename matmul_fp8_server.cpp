@@ -718,6 +718,540 @@ void exp7_single_core_l1_lookup() {
     std::cout << std::string(100, '-') << "\n";
 }
 
+// ====================== 实验8：两级查表（float 子表 + 行并行，无 atomic） ======================
+
+/** 从完整 LUT 构建 G 个 float 细表（4B/entry，直接复制，无需 BF16 转换） */
+static void build_float_fine_tables(int G,
+                                     std::vector<std::vector<float>> &fine_tables,
+                                     const float *lut) {
+    int step = 256 / G;
+    fine_tables.resize(G);
+    for (int g = 0; g < G; ++g) {
+        fine_tables[g].resize(step * 256);
+        std::copy(lut + g * step * 256, lut + (g + 1) * step * 256,
+                  fine_tables[g].begin());
+    }
+}
+
+/**
+ * 两级查表核函数：float 子表 + 行并行
+ *
+ * 对每个 (i,j)，遍历 G 组。每组内标量收集 B_T + 计算子表索引，
+ * SVE gather 从 float 子表加载值并向量化累加。无 atomic。
+ */
+void lookup_two_level_omp(const GroupData &data,
+                           const std::vector<std::vector<float>> &fine_tables,
+                           const uint8_t *B_T, float *C,
+                           int N, int S, int L,
+                           float *core_times, float &sync_time,
+                           float *scalar_times = nullptr,
+                           float *sve_times = nullptr) {
+    int G = data.G, step = data.step;
+
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        int nt = omp_get_num_threads();
+
+        // 静态行分配（模拟 schedule(static)）
+        int rows_per = N / nt;
+        int rem = N % nt;
+        int i_start = tid * rows_per + std::min(tid, rem);
+        int i_end = i_start + rows_per + (tid < rem ? 1 : 0);
+
+        double t_scalar = 0, t_sve = 0;
+        double t0 = omp_get_wtime();
+
+        for (int i = i_start; i < i_end; ++i) {
+            for (int j = 0; j < S; ++j) {
+                float sum = 0.0f;
+                for (int g = 0; g < G; ++g) {
+                    int cnt = data.row_count[i * G + g];
+                    if (cnt == 0) continue;
+
+                    int start = data.row_start[i * G + g];
+                    const uint8_t *a_ptr = data.A_grouped.data() + start;
+                    const int *k_ptr = data.k_indices.data() + start;
+                    const uint8_t *b_row = B_T + j * L;
+                    const float *fine = fine_tables[g].data();
+                    int base = g * step;
+
+                    // 阶段1：标量收集 B_T + 计算子表索引
+                    double ts0 = omp_get_wtime();
+                    alignas(64) uint32_t idx_buf[512];
+                    for (int t = 0; t < cnt; ++t)
+                        idx_buf[t] = (uint32_t)(a_ptr[t] - base) * 256u + b_row[k_ptr[t]];
+                    t_scalar += omp_get_wtime() - ts0;
+
+                    // 阶段2：SVE gather + 累加 + 归约
+                    double ts1 = omp_get_wtime();
+                    svfloat32_t acc = svdup_n_f32(0.0f);
+                    int t = 0;
+                    svbool_t pg = svwhilelt_b32(t, cnt);
+                    while (svptest_any(svptrue_b32(), pg)) {
+                        acc = svadd_f32_m(pg, acc,
+                            svld1_gather_u32index_f32(pg, fine, svld1_u32(pg, idx_buf + t)));
+                        t += svcntw();
+                        pg = svwhilelt_b32(t, cnt);
+                    }
+                    sum += svaddv_f32(svptrue_b32(), acc);
+                    t_sve += omp_get_wtime() - ts1;
+                }
+                C[i * S + j] = sum;
+            }
+        }
+
+        double t1 = omp_get_wtime();
+        core_times[tid] = (t1 - t0) * 1e6;
+        if (scalar_times) scalar_times[tid] = t_scalar * 1e6;
+        if (sve_times)    sve_times[tid]    = t_sve * 1e6;
+
+        #pragma omp barrier
+        #pragma omp master
+        sync_time = (omp_get_wtime() - t1) * 1e6;
+    }
+}
+
+void exp8_two_level_lookup(const float *table, const uint8_t *A,
+                            const uint8_t *B_T, const float *ref,
+                            int N, int S, int L, int num_threads) {
+    std::cout << "\n" << std::string(70, '=') << "\n";
+    std::cout << "实验8: 两级查表优化 (float 子表 + 行并行, " << num_threads << " 核)\n";
+    std::cout << std::string(70, '=') << "\n";
+    std::cout << "矩阵: " << N << "×" << L << " * " << S << "×" << L << "^T\n";
+    std::cout << "子表格式: float (4B), 无 atomic, 行并行\n";
+    std::cout << "Warmup=" << 100 << ", 采样=" << 10000 << "\n\n";
+
+    auto gops = [&](double us) { return double(N) * S * L / us / 1e3; };
+
+    // ——— 基线：SVE + OpenMP 无分组 ———
+    omp_set_num_threads(num_threads);
+    std::vector<float> C_bl(N * S);
+    double base_us = bench([&]() {
+        memset(C_bl.data(), 0, N * S * sizeof(float));
+        lookup_sve_omp(table, A, B_T, C_bl.data(), N, S, L);
+    });
+    bool base_ok = verify(ref, C_bl.data(), N * S);
+
+    // ——— 输出表头（与实验6相同的 15 列） ———
+    std::cout << std::left
+              << std::setw(10) << "方案"
+              << std::setw(8) << "线程"
+              << std::setw(14) << "子表"
+              << std::setw(8) << "级别"
+              << std::setw(18) << "计算(核min~max)"
+              << std::setw(12) << "同步"
+              << std::setw(14) << "标量相位"
+              << std::setw(14) << "SVE相位"
+              << std::setw(14) << "预处理"
+              << std::setw(12) << "L1-miss%"
+              << std::setw(12) << "L2-miss%"
+              << std::setw(18) << "总耗时mean±sd"
+              << std::setw(12) << "总耗时min"
+              << std::setw(10) << "GOP/s"
+              << std::setw(10) << "正确"
+              << "\n" << std::string(175, '-') << "\n";
+
+    // 基线行（per-core 指标不可用，填 "—"）
+    std::cout << std::left
+              << std::setw(10) << "基线SVE"
+              << std::setw(8) << num_threads
+              << std::setw(14) << "256 KiB"
+              << std::setw(8) << "L2"
+              << std::setw(18) << "—"
+              << std::setw(12) << "—"
+              << std::setw(14) << "—"
+              << std::setw(14) << "—"
+              << std::setw(14) << "—"
+              << std::setw(12) << "—"
+              << std::setw(12) << "—"
+              << std::setw(18) << std::fixed << std::setprecision(1) << base_us
+              << std::setw(12) << "—"
+              << std::setw(10) << std::fixed << std::setprecision(2) << gops(base_us)
+              << std::setw(10) << (base_ok ? "OK" : "FAIL") << "\n";
+
+    // ——— 扫描 G ———
+    constexpr int G_VALS[] = {1, 2, 4, 8, 16, 32, 64};
+    constexpr int WARMUP = 100;
+    constexpr int ITERS = 10000;
+
+    for (int Gi : G_VALS) {
+        if (Gi > omp_get_max_threads()) continue;
+
+        // ── 预处理（计时） ──
+        double t_prep = omp_get_wtime();
+        GroupData gd = preprocess_groups(A, N, L, Gi);
+        std::vector<std::vector<float>> fine_tables;
+        build_float_fine_tables(Gi, fine_tables, table);
+        double prep_us = (omp_get_wtime() - t_prep) * 1e6;
+
+        int sub_kib = (256 / Gi) * 256 * 4 / 1024;  // float 4B
+        const char *cl = cache_level(sub_kib, L1D_KiB, L2_KiB);
+
+        // ── Perf 计数器（打开失败则降级） ──
+        PerfCounter pc_l1_acc(ArmPmu::L1D_CACHE);
+        PerfCounter pc_l1_miss(ArmPmu::L1D_CACHE_REFILL);
+        PerfCounter pc_l2_acc(ArmPmu::L2D_CACHE);
+        PerfCounter pc_l2_miss(ArmPmu::L2D_CACHE_REFILL);
+        bool perf_ok = pc_l1_acc.ok() && pc_l1_miss.ok();
+
+        // ── 复用缓冲区 ──
+        std::vector<float> C_g(N * S, 0);
+        std::vector<float> core_t(num_threads);
+        std::vector<float> scalar_t(num_threads), sve_t(num_threads);
+        float sync_t = 0;
+
+        // ── Warmup ──
+        for (int w = 0; w < WARMUP; ++w) {
+            std::fill(C_g.begin(), C_g.end(), 0);
+            lookup_two_level_omp(gd, fine_tables, B_T, C_g.data(), N, S, L,
+                                 core_t.data(), sync_t);
+        }
+
+        // ── 测量 ──
+        // 在线统计：总耗时
+        double sum_total = 0, sum_total2 = 0;
+        double min_total = 1e18, max_total = 0;
+        // 同步时间
+        double sum_sync = 0;
+        // 阶段耗时（累计后取平均）
+        double sum_scalar = 0, sum_sve = 0;
+        // 最佳单次（用于输出 compute min~max）
+        double best_total = 1e18;
+        float best_sync = 0;
+        std::vector<float> best_core(num_threads);
+
+        // 启动 perf 计数器（从第一次测量开始累计）
+        if (perf_ok) {
+            pc_l1_acc.reset(); pc_l1_acc.enable();
+            pc_l1_miss.reset(); pc_l1_miss.enable();
+            if (pc_l2_acc.ok()) { pc_l2_acc.reset(); pc_l2_acc.enable(); }
+            if (pc_l2_miss.ok()) { pc_l2_miss.reset(); pc_l2_miss.enable(); }
+        }
+
+        for (int iter = 0; iter < ITERS; ++iter) {
+            std::fill(C_g.begin(), C_g.end(), 0);
+            std::fill(core_t.begin(), core_t.end(), 0);
+            std::fill(scalar_t.begin(), scalar_t.end(), 0);
+            std::fill(sve_t.begin(), sve_t.end(), 0);
+            sync_t = 0;
+
+            lookup_two_level_omp(gd, fine_tables, B_T, C_g.data(), N, S, L,
+                                 core_t.data(), sync_t,
+                                 scalar_t.data(), sve_t.data());
+
+            // 累加阶段耗时（取每核 max，因为最慢核决定总时间）
+            double max_scalar = *std::max_element(scalar_t.begin(), scalar_t.end());
+            double max_sve = *std::max_element(sve_t.begin(), sve_t.end());
+            sum_scalar += max_scalar;
+            sum_sve += max_sve;
+
+            double total = *std::max_element(core_t.begin(), core_t.end()) + sync_t;
+
+            // 更新在线统计
+            sum_total += total;
+            sum_total2 += total * total;
+            if (total < min_total) min_total = total;
+            if (total > max_total) max_total = total;
+            sum_sync += sync_t;
+
+            // 记录最优单次（用于输出计算核时间）
+            if (total < best_total) {
+                best_total = total;
+                best_sync = sync_t;
+                best_core = core_t;
+            }
+        }
+
+        // 停止 perf 计数器
+        if (perf_ok) {
+            pc_l1_acc.disable();
+            pc_l1_miss.disable();
+            if (pc_l2_acc.ok()) pc_l2_acc.disable();
+            if (pc_l2_miss.ok()) pc_l2_miss.disable();
+        }
+
+        // ── 统计计算 ──
+        double mean_total = sum_total / ITERS;
+        double var_total = (sum_total2 - sum_total * mean_total) / (ITERS - 1);
+        double sd_total = std::sqrt(std::max(0.0, var_total));
+        double avg_sync = sum_sync / ITERS;
+        double avg_scalar = sum_scalar / ITERS;
+        double avg_sve = sum_sve / ITERS;
+
+        float cmin = *std::min_element(best_core.begin(), best_core.end());
+        float cmax = *std::max_element(best_core.begin(), best_core.end());
+        double gops_min = gops(min_total);
+
+        // ── Cache miss rate ──
+        double l1_miss_rate = -1, l2_miss_rate = -1;
+        if (perf_ok) {
+            uint64_t l1_a = pc_l1_acc.read();
+            uint64_t l1_m = pc_l1_miss.read();
+            if (l1_a > 0) l1_miss_rate = 100.0 * l1_m / l1_a;
+
+            if (pc_l2_acc.ok() && pc_l2_miss.ok()) {
+                uint64_t l2_a = pc_l2_acc.read();
+                uint64_t l2_m = pc_l2_miss.read();
+                if (l2_a > 0) l2_miss_rate = 100.0 * l2_m / l2_a;
+            }
+        }
+
+        bool ok = verify(ref, C_g.data(), N * S);
+
+        // ── 输出 ──
+        std::ostringstream ss_sub;
+        ss_sub << sub_kib << " KiB";
+
+        std::ostringstream ss_comp;
+        ss_comp << std::fixed << std::setprecision(1) << cmin << "~" << cmax;
+
+        std::ostringstream ss_total;
+        ss_total << std::fixed << std::setprecision(1) << mean_total
+                 << "±" << std::setprecision(1) << sd_total;
+
+        // L1 miss rate 字符串
+        std::string s_l1mr = "—";
+        if (l1_miss_rate >= 0) {
+            std::ostringstream ss; ss << std::fixed << std::setprecision(2) << l1_miss_rate << "%";
+            s_l1mr = ss.str();
+        }
+        std::string s_l2mr = "—";
+        if (l2_miss_rate >= 0) {
+            std::ostringstream ss; ss << std::fixed << std::setprecision(2) << l2_miss_rate << "%";
+            s_l2mr = ss.str();
+        }
+
+        std::cout << std::left
+                  << std::setw(10) << ("TL-G=" + std::to_string(Gi)).c_str()
+                  << std::setw(8) << num_threads
+                  << std::setw(14) << ss_sub.str()
+                  << std::setw(8) << cl
+                  << std::setw(18) << ss_comp.str()
+                  << std::setw(12) << std::fixed << std::setprecision(1) << avg_sync
+                  << std::setw(14) << std::fixed << std::setprecision(1) << avg_scalar
+                  << std::setw(14) << std::fixed << std::setprecision(1) << avg_sve
+                  << std::setw(14) << std::fixed << std::setprecision(1) << prep_us
+                  << std::setw(12) << s_l1mr
+                  << std::setw(12) << s_l2mr
+                  << std::setw(18) << ss_total.str()
+                  << std::setw(12) << std::fixed << std::setprecision(1) << min_total
+                  << std::setw(10) << std::fixed << std::setprecision(2) << gops_min
+                  << std::setw(10) << (ok ? "OK" : "FAIL") << "\n";
+    }
+    std::cout << "\n";
+}
+
+// ====================== 实验9：矩阵加载对查表微基准的影响 ======================
+
+void exp9_matrix_load_microbench() {
+    constexpr int N = 128, S = 328, L = 512;
+    constexpr int TABLE_B = 256;
+    constexpr int TABLE_A_VALS[] = {2, 4, 8, 16, 32};
+    constexpr int WARMUP = 20;
+    constexpr int ITERS = 200;
+
+    std::cout << "\n" << std::string(70, '=') << "\n";
+    std::cout << "实验9: 矩阵加载对查表微基准的影响 (单核)\n";
+    std::cout << std::string(70, '=') << "\n";
+    std::cout << "矩阵: A=" << N << "×" << L << "=" << (N*L/1024) << "KiB, ";
+    std::cout << "B_T=" << S << "×" << L << "=" << (S*L/1024) << "KiB\n";
+    std::cout << "子表格式: BF16 (2B), 单核, 三阶段计时 (omp_get_wtime)\n";
+    std::cout << "查表次数/迭代: " << (int64_t)N * S * L << "\n";
+    std::cout << "Warmup=" << WARMUP << ", 采样=" << ITERS << "\n\n";
+
+    // 生成矩阵
+    std::vector<uint8_t> A(N * L);
+    std::vector<uint8_t> B_T(S * L);
+    fill_random(A.data(), N * L);
+    fill_random(B_T.data(), S * L);
+
+    // 完整 LUT（用于构建子表）
+    std::vector<float> LUT(LUT_SIZE);
+    gen_lut(LUT.data());
+
+    int64_t total_lookups = (int64_t)N * S * L;
+
+    // 存储每次查表结果用于与 exp7 对比
+    double exp9_per_lookup_ns[5] = {0};
+
+    // 输出表头
+    std::cout << std::left
+              << std::setw(16) << "表维度"
+              << std::setw(14) << "表大小(KiB)"
+              << std::setw(18) << "查表次数"
+              << std::setw(16) << "平均耗时(μs)"
+              << std::setw(14) << "每次查表(ns)"
+              << std::setw(14) << "L1-miss%"
+              << std::setw(14) << "标量(μs)"
+              << std::setw(14) << "SVE累加(μs)"
+              << std::setw(14) << "归约(μs)"
+              << "\n" << std::string(145, '-') << "\n";
+
+    for (int ti = 0; ti < 5; ++ti) {
+        int table_a = TABLE_A_VALS[ti];
+        int entries = table_a * TABLE_B;
+        int kib = entries * 2 / 1024;
+
+        // 构建 BF16 子表
+        std::vector<uint16_t> sub(entries);
+        for (int a = 0; a < table_a; ++a)
+            for (int b = 0; b < TABLE_B; ++b)
+                sub[a * TABLE_B + b] = float_to_bf16(LUT[a * TABLE_B + b]);
+
+        std::vector<float> C(N * S, 0);
+        alignas(64) float local_vals[L];
+
+        // Warmup
+        for (int w = 0; w < WARMUP; ++w) {
+            std::fill(C.begin(), C.end(), 0);
+            for (int i = 0; i < N; ++i) {
+                const uint8_t *a_row = A.data() + i * L;
+                for (int j = 0; j < S; ++j) {
+                    const uint8_t *b_row = B_T.data() + j * L;
+                    float sum = 0.0f;
+                    for (int k = 0; k < L; ++k) {
+                        int a_val = a_row[k] % table_a;
+                        int idx = a_val * TABLE_B + b_row[k];
+                        uint32_t bits = (uint32_t)sub[idx] << 16;
+                        float v;
+                        memcpy(&v, &bits, 4);
+                        sum += v;
+                    }
+                    C[i * S + j] = sum;
+                }
+            }
+        }
+
+        // PMU（累计 ITERS 次完整迭代）
+        PerfCounter pc_l1_acc(ArmPmu::L1D_CACHE);
+        PerfCounter pc_l1_miss(ArmPmu::L1D_CACHE_REFILL);
+        bool perf_ok = pc_l1_acc.ok() && pc_l1_miss.ok();
+        if (perf_ok) {
+            pc_l1_acc.reset(); pc_l1_acc.enable();
+            pc_l1_miss.reset(); pc_l1_miss.enable();
+        }
+
+        // 正式测量：三阶段计时
+        double sum_total = 0, sum_scalar = 0, sum_sve_acc = 0, sum_sve_rdc = 0;
+
+        for (int iter = 0; iter < ITERS; ++iter) {
+            std::fill(C.begin(), C.end(), 0);
+
+            for (int i = 0; i < N; ++i) {
+                const uint8_t *a_row = A.data() + i * L;
+                for (int j = 0; j < S; ++j) {
+                    const uint8_t *b_row = B_T.data() + j * L;
+
+                    double t0 = omp_get_wtime();
+                    // 阶段1: 标量 A/B 加载 + 子表查表 + BF16→float
+                    for (int k = 0; k < L; ++k) {
+                        int a_val = a_row[k] % table_a;
+                        int idx = a_val * TABLE_B + b_row[k];
+                        uint32_t bits = (uint32_t)sub[idx] << 16;
+                        memcpy(&local_vals[k], &bits, 4);
+                    }
+                    double t1 = omp_get_wtime();
+
+                    // 阶段2: SVE 向量化累加
+                    svfloat32_t acc = svdup_n_f32(0.0f);
+                    int t = 0;
+                    svbool_t pg = svwhilelt_b32(t, L);
+                    while (svptest_any(svptrue_b32(), pg)) {
+                        acc = svadd_f32_m(pg, acc, svld1_f32(pg, local_vals + t));
+                        t += svcntw();
+                        pg = svwhilelt_b32(t, L);
+                    }
+                    double t2 = omp_get_wtime();
+
+                    // 阶段3: SVE 归约 + 写 C
+                    C[i * S + j] = svaddv_f32(svptrue_b32(), acc);
+                    double t3 = omp_get_wtime();
+
+                    sum_scalar += t1 - t0;
+                    sum_sve_acc += t2 - t1;
+                    sum_sve_rdc += t3 - t2;
+                    sum_total += t3 - t0;
+                }
+            }
+        }
+
+        if (perf_ok) {
+            pc_l1_acc.disable();
+            pc_l1_miss.disable();
+        }
+
+        // 统计
+        double avg_total_us = sum_total / ITERS * 1e6;
+        double avg_scalar_us = sum_scalar / ITERS * 1e6;
+        double avg_sve_acc_us = sum_sve_acc / ITERS * 1e6;
+        double avg_sve_rdc_us = sum_sve_rdc / ITERS * 1e6;
+        double per_lookup_ns = avg_total_us * 1000 / total_lookups;
+        exp9_per_lookup_ns[ti] = per_lookup_ns;
+
+        // 阶段占比
+        double pct_scalar = avg_scalar_us / avg_total_us * 100;
+        double pct_sve_acc = avg_sve_acc_us / avg_total_us * 100;
+        double pct_sve_rdc = avg_sve_rdc_us / avg_total_us * 100;
+
+        // L1-miss%
+        std::string s_l1mr = "—";
+        if (perf_ok) {
+            uint64_t l1_a = pc_l1_acc.read();
+            uint64_t l1_m = pc_l1_miss.read();
+            if (l1_a > 0) {
+                double rate = 100.0 * l1_m / l1_a;
+                std::ostringstream ss;
+                ss << std::fixed << std::setprecision(2) << rate << "%";
+                s_l1mr = ss.str();
+            }
+        }
+
+        std::cout << std::left
+                  << std::setw(16) << (std::to_string(table_a) + "×256").c_str()
+                  << std::setw(14) << kib
+                  << std::setw(18) << total_lookups
+                  << std::setw(16) << std::fixed << std::setprecision(1) << avg_total_us
+                  << std::setw(14) << std::fixed << std::setprecision(2) << per_lookup_ns
+                  << std::setw(14) << s_l1mr
+                  << std::setw(14) << std::fixed << std::setprecision(1) << avg_scalar_us
+                  << std::setw(14) << std::fixed << std::setprecision(1) << avg_sve_acc_us
+                  << std::setw(14) << std::fixed << std::setprecision(1) << avg_sve_rdc_us
+                  << "\n";
+
+        // 附加阶段占比
+        std::cout << std::string(15, ' ')
+                  << "  占比: 标量=" << std::fixed << std::setprecision(1) << pct_scalar << "%"
+                  << "  SVE累加=" << std::fixed << std::setprecision(1) << pct_sve_acc << "%"
+                  << "  归约=" << std::fixed << std::setprecision(1) << pct_sve_rdc << "%"
+                  << "\n";
+    }
+    std::cout << std::string(145, '-') << "\n";
+
+    // === 与 exp7 对比 ===
+    double exp7_per_lookup[] = {1.39, 1.97, 3.18, 5.93, 11.38};
+    std::cout << "\n对比实验7(纯查表) 每次查表(ns):\n";
+    std::cout << std::left
+              << std::setw(12) << "table_a"
+              << std::setw(18) << "exp7(纯查表)"
+              << std::setw(22) << "exp9(矩阵加载)"
+              << std::setw(14) << "差值"
+              << std::setw(14) << "比率"
+              << "\n" << std::string(80, '-') << "\n";
+    for (int i = 0; i < 5; ++i) {
+        double diff = exp9_per_lookup_ns[i] - exp7_per_lookup[i];
+        double ratio = exp9_per_lookup_ns[i] / exp7_per_lookup[i];
+        std::cout << std::left
+                  << std::setw(12) << TABLE_A_VALS[i]
+                  << std::setw(18) << std::fixed << std::setprecision(2) << exp7_per_lookup[i]
+                  << std::setw(22) << std::fixed << std::setprecision(2) << exp9_per_lookup_ns[i]
+                  << std::setw(14) << std::fixed << std::setprecision(2) << diff
+                  << std::setw(14) << std::fixed << std::setprecision(2) << ratio << "×"
+                  << "\n";
+    }
+    std::cout << "\n";
+}
+
 // ====================== Main ======================
 
 int main(int argc, char *argv[]) {
@@ -759,6 +1293,15 @@ int main(int argc, char *argv[]) {
     // 实验7: 单核 L1 小表微基准 (SVE 归约)
     if (!only_exp || only_exp == 7)
         exp7_single_core_l1_lookup();
+
+    // 实验8: 两级查表优化 (float 子表 + 行并行)
+    if (!only_exp || only_exp == 8)
+        exp8_two_level_lookup(LUT.data(), A.data(), B_T.data(), C_ref.data(),
+                               N1, S1, L1, 80);
+
+    // 实验9: 矩阵加载对查表微基准的影响
+    if (!only_exp || only_exp == 9)
+        exp9_matrix_load_microbench();
 
     std::cout << "\n测试完成!\n";
     return 0;
