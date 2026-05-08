@@ -1070,18 +1070,14 @@ void exp9_matrix_load_microbench() {
 
     int64_t total_lookups = (int64_t)N * S * L;
 
-    // 存储每次查表结果用于与 exp7 对比
-    double exp9_per_lookup_ns[5] = {0};
-
     // 输出表头
     std::cout << std::left
               << std::setw(16) << "表维度"
               << std::setw(14) << "表大小(KiB)"
               << std::setw(18) << "查表次数"
               << std::setw(16) << "平均耗时(μs)"
-              << std::setw(14) << "每次查表(ns)"
               << std::setw(14) << "L1-miss%"
-              << "\n" << std::string(95, '-') << "\n";
+              << "\n" << std::string(80, '-') << "\n";
 
     for (int ti = 0; ti < 5; ++ti) {
         int table_a = TABLE_A_VALS[ti];
@@ -1173,8 +1169,6 @@ void exp9_matrix_load_microbench() {
         }
 
         double avg_total_us = sum_total / ITERS;
-        double per_lookup_ns = avg_total_us * 1000 / total_lookups;
-        exp9_per_lookup_ns[ti] = per_lookup_ns;
 
         // L1-miss%
         std::string s_l1mr = "—";
@@ -1194,34 +1188,10 @@ void exp9_matrix_load_microbench() {
                   << std::setw(14) << kib
                   << std::setw(18) << total_lookups
                   << std::setw(16) << std::fixed << std::setprecision(1) << avg_total_us
-                  << std::setw(14) << std::fixed << std::setprecision(2) << per_lookup_ns
                   << std::setw(14) << s_l1mr
                   << "\n";
     }
-    std::cout << std::string(95, '-') << "\n";
-
-    // === 与 exp7 对比 ===
-    double exp7_per_lookup[] = {1.39, 1.97, 3.18, 5.93, 11.38};
-    std::cout << "\n对比实验7(纯查表) 每次查表(ns):\n";
-    std::cout << std::left
-              << std::setw(12) << "table_a"
-              << std::setw(18) << "exp7(纯查表)"
-              << std::setw(22) << "exp9(矩阵加载)"
-              << std::setw(14) << "差值"
-              << std::setw(14) << "比率"
-              << "\n" << std::string(80, '-') << "\n";
-    for (int i = 0; i < 5; ++i) {
-        double diff = exp9_per_lookup_ns[i] - exp7_per_lookup[i];
-        double ratio = exp9_per_lookup_ns[i] / exp7_per_lookup[i];
-        std::cout << std::left
-                  << std::setw(12) << TABLE_A_VALS[i]
-                  << std::setw(18) << std::fixed << std::setprecision(2) << exp7_per_lookup[i]
-                  << std::setw(22) << std::fixed << std::setprecision(2) << exp9_per_lookup_ns[i]
-                  << std::setw(14) << std::fixed << std::setprecision(2) << diff
-                  << std::setw(14) << std::fixed << std::setprecision(2) << ratio << "×"
-                  << "\n";
-    }
-    std::cout << "\n";
+    std::cout << std::string(80, '-') << "\n";
 }
 
 // ====================== Main ======================
