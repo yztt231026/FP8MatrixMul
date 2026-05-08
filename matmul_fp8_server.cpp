@@ -1046,152 +1046,116 @@ void exp8_two_level_lookup(const float *table, const uint8_t *A,
 
 void exp9_matrix_load_microbench() {
     constexpr int N = 128, S = 328, L = 512;
-    constexpr int TABLE_B = 256;
-    constexpr int TABLE_A_VALS[] = {2, 4, 8, 16, 32};
+    constexpr int TABLE_DIMS[] = {256, 128, 64, 32, 16};
     constexpr int WARMUP = 20;
-    constexpr int ITERS = 200;
+    constexpr int ITERS = 100;
 
     std::cout << "\n" << std::string(70, '=') << "\n";
-    std::cout << "实验9: 矩阵加载对查表微基准的影响 (单核)\n";
+    std::cout << "实验9: 标量 vs SVE gather — 不同 LUT 维度对比 (单核)\n";
     std::cout << std::string(70, '=') << "\n";
-    std::cout << "矩阵: A=" << N << "×" << L << "=" << (N*L/1024) << "KiB, ";
-    std::cout << "B_T=" << S << "×" << L << "=" << (S*L/1024) << "KiB\n";
-    std::cout << "子表格式: BF16 (2B), 单核, 三阶段计时 (omp_get_wtime)\n";
-    std::cout << "查表次数/迭代: " << (int64_t)N * S * L << "\n";
+    std::cout << "矩阵: " << N << "×" << L << " × " << S << "×" << L << "^T\n";
+    std::cout << "LUT 格式: float (4B), 单核\n";
+    std::cout << "标量: lookup_scalar (顺序加载)\n";
+    std::cout << "SVE:  gather_lookup (svld1_gather_u32index_f32, _z 归约)\n";
     std::cout << "Warmup=" << WARMUP << ", 采样=" << ITERS << "\n\n";
 
-    // 完整 LUT（用于构建子表）
-    std::vector<float> LUT(LUT_SIZE);
-    gen_lut(LUT.data());
-
-    // B_T 矩阵（所有配置共用，idxB 值域 [0, 255]）
-    std::vector<uint8_t> B_T(S * L);
-    fill_random(B_T.data(), S * L);
-
-    int64_t total_lookups = (int64_t)N * S * L;
+    auto bench_us = [&](auto fn) {
+        for (int w = 0; w < WARMUP; ++w) fn();
+        double sum = 0;
+        for (int t = 0; t < ITERS; ++t) {
+            auto t0 = high_resolution_clock::now();
+            fn();
+            auto t1 = high_resolution_clock::now();
+            sum += duration_cast<nanoseconds>(t1 - t0).count() / 1000.0;
+        }
+        return sum / ITERS;
+    };
 
     // 输出表头
     std::cout << std::left
-              << std::setw(16) << "表维度"
-              << std::setw(14) << "表大小(KiB)"
-              << std::setw(18) << "查表次数"
-              << std::setw(16) << "平均耗时(μs)"
-              << std::setw(14) << "L1-miss%"
-              << "\n" << std::string(80, '-') << "\n";
+              << std::setw(14) << "LUT 维度"
+              << std::setw(14) << "LUT 大小"
+              << std::setw(16) << "Cache 层级"
+              << std::setw(18) << "标量(μs)"
+              << std::setw(18) << "SVE gather(μs)"
+              << std::setw(14) << "加速比"
+              << "\n" << std::string(95, '-') << "\n";
 
-    for (int ti = 0; ti < 5; ++ti) {
-        int table_a = TABLE_A_VALS[ti];
-        int entries = table_a * TABLE_B;
-        int kib = entries * 2 / 1024;
+    for (int dim : TABLE_DIMS) {
+        int lut_kib = dim * dim * 4 / 1024;
 
-        // 生成 A 矩阵，idxA 值约束到 [0, table_a-1]
-        std::vector<uint8_t> A(N * L);
-        for (size_t i = 0; i < A.size(); ++i)
-            A[i] = rand() % table_a;
+        // 生成 LUT: dim × dim float
+        std::vector<float> lut(dim * dim);
+        for (int a = 0; a < dim; ++a)
+            for (int b = 0; b < dim; ++b)
+                lut[a * dim + b] = sinf(a * 0.1f) * cosf(b * 0.1f);
 
-        // 构建 BF16 子表
-        std::vector<uint16_t> sub(entries);
-        for (int a = 0; a < table_a; ++a)
-            for (int b = 0; b < TABLE_B; ++b)
-                sub[a * TABLE_B + b] = float_to_bf16(LUT[a * TABLE_B + b]);
+        // 生成 A, B_T，值约束到 [0, dim-1]
+        std::vector<uint8_t> A(N * L), B_T(S * L);
+        for (auto &v : A) v = rand() % dim;
+        for (auto &v : B_T) v = rand() % dim;
 
-        std::vector<float> C(N * S, 0);
-        alignas(64) float local_vals[L];
+        std::vector<float> C(N * S);
 
-        // Warmup
-        for (int w = 0; w < WARMUP; ++w) {
-            std::fill(C.begin(), C.end(), 0);
+        // ——— 标量版本 ———
+        double t_scalar = bench_us([&]() {
             for (int i = 0; i < N; ++i) {
-                const uint8_t *a_row = A.data() + i * L;
+                const uint8_t *rowA = A.data() + i * L;
                 for (int j = 0; j < S; ++j) {
-                    const uint8_t *b_row = B_T.data() + j * L;
+                    const uint8_t *rowB = B_T.data() + j * L;
                     float sum = 0.0f;
-                    for (int k = 0; k < L; ++k) {
-                        int idx = a_row[k] * TABLE_B + b_row[k];
-                        uint32_t bits = (uint32_t)sub[idx] << 16;
-                        float v;
-                        memcpy(&v, &bits, 4);
-                        sum += v;
-                    }
+                    for (int k = 0; k < L; ++k)
+                        sum += lut[rowA[k] * dim + rowB[k]];
                     C[i * S + j] = sum;
                 }
             }
-        }
+        });
 
-        // PMU（累计 ITERS 次完整迭代）
-        PerfCounter pc_l1_acc(ArmPmu::L1D_CACHE);
-        PerfCounter pc_l1_miss(ArmPmu::L1D_CACHE_REFILL);
-        bool perf_ok = pc_l1_acc.ok() && pc_l1_miss.ok();
-        if (perf_ok) {
-            pc_l1_acc.reset(); pc_l1_acc.enable();
-            pc_l1_miss.reset(); pc_l1_miss.enable();
-        }
-
-        // 正式测量：整体计时，仅统计平均耗时
-        double sum_total = 0;
-
-        for (int iter = 0; iter < ITERS; ++iter) {
-            std::fill(C.begin(), C.end(), 0);
-
-            auto t0 = high_resolution_clock::now();
+        // ——— SVE gather 版本 ———
+        double t_sve = bench_us([&]() {
             for (int i = 0; i < N; ++i) {
-                const uint8_t *a_row = A.data() + i * L;
+                const uint8_t *rowA = A.data() + i * L;
                 for (int j = 0; j < S; ++j) {
-                    const uint8_t *b_row = B_T.data() + j * L;
-
-                    // 标量 A/B 加载 + 子表查表 + BF16→float
-                    for (int k = 0; k < L; ++k) {
-                        int idx = a_row[k] * TABLE_B + b_row[k];
-                        uint32_t bits = (uint32_t)sub[idx] << 16;
-                        memcpy(&local_vals[k], &bits, 4);
-                    }
-
-                    // SVE 向量化累加 + 归约
+                    const uint8_t *rowB = B_T.data() + j * L;
                     svfloat32_t acc = svdup_n_f32(0.0f);
-                    int t = 0;
-                    svbool_t pg = svwhilelt_b32(t, L);
+                    int k = 0;
+                    svbool_t pg = svwhilelt_b32(k, L);
                     while (svptest_any(svptrue_b32(), pg)) {
-                        acc = svadd_f32_m(pg, acc, svld1_f32(pg, local_vals + t));
-                        t += svcntw();
-                        pg = svwhilelt_b32(t, L);
+                        svuint32_t idxA = svld1ub_u32(pg, &rowA[k]);
+                        svuint32_t idxB = svld1ub_u32(pg, &rowB[k]);
+                        // idxA * dim + idxB（dim 在编译期常量传播后为 immed）
+                        svuint32_t idx = svadd_u32_z(pg,
+                            svmul_n_u32_z(pg, idxA, dim), idxB);
+                        acc = svadd_f32_z(pg, acc,
+                            svld1_gather_u32index_f32(pg, lut.data(), idx));
+                        k += svcntw();
+                        pg = svwhilelt_b32(k, L);
                     }
                     C[i * S + j] = svaddv_f32(svptrue_b32(), acc);
                 }
             }
-            auto t1 = high_resolution_clock::now();
+        });
 
-            sum_total += duration_cast<nanoseconds>(t1 - t0).count() / 1000.0;
-        }
+        const char *cache_lvl = (lut_kib <= 64) ? "L1" : "L2";
+        double speedup = t_scalar / t_sve;
 
-        if (perf_ok) {
-            pc_l1_acc.disable();
-            pc_l1_miss.disable();
-        }
-
-        double avg_total_us = sum_total / ITERS;
-
-        // L1-miss%
-        std::string s_l1mr = "—";
-        if (perf_ok) {
-            uint64_t l1_a = pc_l1_acc.read();
-            uint64_t l1_m = pc_l1_miss.read();
-            if (l1_a > 0) {
-                double rate = 100.0 * l1_m / l1_a;
-                std::ostringstream ss;
-                ss << std::fixed << std::setprecision(2) << rate << "%";
-                s_l1mr = ss.str();
-            }
-        }
+        // LUT 大小字符串
+        std::string s_size;
+        if (lut_kib < 1024)
+            s_size = std::to_string(lut_kib) + " KiB";
+        else
+            s_size = std::to_string(lut_kib / 1024) + " MiB";
 
         std::cout << std::left
-                  << std::setw(16) << (std::to_string(table_a) + "×256").c_str()
-                  << std::setw(14) << kib
-                  << std::setw(18) << total_lookups
-                  << std::setw(16) << std::fixed << std::setprecision(1) << avg_total_us
-                  << std::setw(14) << s_l1mr
+                  << std::setw(14) << (std::to_string(dim) + "×" + std::to_string(dim))
+                  << std::setw(14) << s_size
+                  << std::setw(16) << cache_lvl
+                  << std::setw(18) << std::fixed << std::setprecision(1) << t_scalar
+                  << std::setw(18) << std::fixed << std::setprecision(1) << t_sve
+                  << std::setw(14) << std::fixed << std::setprecision(2) << speedup << "×"
                   << "\n";
     }
-    std::cout << std::string(80, '-') << "\n";
+    std::cout << "\n";
 }
 
 // ====================== Main ======================
