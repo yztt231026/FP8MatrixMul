@@ -576,77 +576,28 @@ void exp7_single_core_l1_lookup() {
     std::cout << std::string(70, '=') << "\n";
 
     constexpr int TABLE_B = 256;
-    constexpr int N_LOOKUPS = 128;
+    constexpr int MAX_LOOKUPS = 128;      // 最大查表次数（table_a=2 时）
     constexpr int TABLE_A_VALS[] = {2, 4, 8, 16, 32};
-
-    // 测量 lambda：对给定表大小执行一次 benchmark（warmup + 采样），返回最小值
-    auto measure = [&](int table_a, const uint8_t *a_vals, const uint8_t *b_vals,
-                       const uint16_t *sub) -> double {
-        constexpr int WARMUP = 2000;
-        constexpr int ITERS = 20000;
-
-        volatile float sink = 0;
-
-        // Warmup
-        for (int w = 0; w < WARMUP; ++w) {
-            alignas(64) float local_vals[N_LOOKUPS];
-            for (int i = 0; i < N_LOOKUPS; ++i) {
-                int idx = a_vals[i] * TABLE_B + b_vals[i];
-                uint32_t bits = (uint32_t)sub[idx] << 16;
-                memcpy(&local_vals[i], &bits, 4);
-            }
-            svfloat32_t acc = svdup_n_f32(0.0f);
-            int t = 0;
-            svbool_t pg = svwhilelt_b32(t, N_LOOKUPS);
-            while (svptest_any(svptrue_b32(), pg)) {
-                acc = svadd_f32_m(pg, acc, svld1_f32(pg, local_vals + t));
-                t += svcntw();
-                pg = svwhilelt_b32(t, N_LOOKUPS);
-            }
-            sink = svaddv_f32(svptrue_b32(), acc);
-        }
-
-        // 正式测量
-        double min_us = 1e18;
-        for (int iter = 0; iter < ITERS; ++iter) {
-            auto t0 = high_resolution_clock::now();
-
-            alignas(64) float local_vals[N_LOOKUPS];
-            for (int i = 0; i < N_LOOKUPS; ++i) {
-                int idx = a_vals[i] * TABLE_B + b_vals[i];
-                uint32_t bits = (uint32_t)sub[idx] << 16;
-                memcpy(&local_vals[i], &bits, 4);
-            }
-            svfloat32_t acc = svdup_n_f32(0.0f);
-            int t = 0;
-            svbool_t pg = svwhilelt_b32(t, N_LOOKUPS);
-            while (svptest_any(svptrue_b32(), pg)) {
-                acc = svadd_f32_m(pg, acc, svld1_f32(pg, local_vals + t));
-                t += svcntw();
-                pg = svwhilelt_b32(t, N_LOOKUPS);
-            }
-            sink = svaddv_f32(svptrue_b32(), acc);
-
-            auto t1 = high_resolution_clock::now();
-            double us = duration_cast<nanoseconds>(t1 - t0).count() / 1000.0;
-            if (us < min_us) min_us = us;
-        }
-        return min_us;
-    };
+    constexpr int WARMUP = 2000;
+    constexpr int ITERS = 20000;
 
     // 输出表头
     std::cout << std::left
               << std::setw(16) << "表维度"
-              << std::setw(14) << "表大小(entries)"
-              << std::setw(12) << "表大小(KiB)"
-              << std::setw(14) << "耗时min(μs)"
-              << std::setw(16) << "每次查表(ns)"
-              << std::setw(14) << "每次查表(cyc)"
-              << "\n" << std::string(85, '-') << "\n";
+              << std::setw(14) << "表大小(KiB)"
+              << std::setw(14) << "查表次数"
+              << std::setw(16) << "平均耗时(μs)"
+              << std::setw(14) << "总查表(ns)"
+              << std::setw(14) << "每次查表(ns)"
+              << std::setw(14) << "L1-miss%"
+              << "\n" << std::string(100, '-') << "\n";
+
+    alignas(64) float local_vals[MAX_LOOKUPS];  // 预分配最大空间
 
     for (int table_a : TABLE_A_VALS) {
         int entries = table_a * TABLE_B;
-        int kib = entries * 2 / 1024;  // BF16 2B/entry
+        int kib = entries * 2 / 1024;   // BF16 2B/entry
+        int n_lookups = MAX_LOOKUPS / (table_a / 2);  // 128, 64, 32, 16, 8
 
         // 构建 BF16 表
         std::vector<uint16_t> sub(entries);
@@ -654,27 +605,98 @@ void exp7_single_core_l1_lookup() {
             for (int b = 0; b < TABLE_B; ++b)
                 sub[a * TABLE_B + b] = float_to_bf16(sinf(a * 0.1f) * cosf(b * 0.1f));
 
-        // 生成 128 对 (a, b)，a ∈ [0, table_a-1]
-        std::vector<uint8_t> a_vals(N_LOOKUPS), b_vals(N_LOOKUPS);
-        fill_random(a_vals.data(), N_LOOKUPS);
+        // 生成 (a, b) 对，a ∈ [0, table_a-1]
+        std::vector<uint8_t> a_vals(n_lookups), b_vals(n_lookups);
+        fill_random(a_vals.data(), n_lookups);
         for (auto &v : a_vals) v %= table_a;
-        fill_random(b_vals.data(), N_LOOKUPS);
+        fill_random(b_vals.data(), n_lookups);
 
-        double min_us = measure(table_a, a_vals.data(), b_vals.data(), sub.data());
+        volatile float sink = 0;
 
-        double ns_per_lookup = min_us / N_LOOKUPS * 1000;
-        int cyc_per_lookup = (int)(ns_per_lookup * 2.4);
+        // Warmup
+        for (int w = 0; w < WARMUP; ++w) {
+            for (int i = 0; i < n_lookups; ++i) {
+                int idx = a_vals[i] * TABLE_B + b_vals[i];
+                uint32_t bits = (uint32_t)sub[idx] << 16;
+                memcpy(&local_vals[i], &bits, 4);
+            }
+            svfloat32_t acc = svdup_n_f32(0.0f);
+            int t = 0;
+            svbool_t pg = svwhilelt_b32(t, n_lookups);
+            while (svptest_any(svptrue_b32(), pg)) {
+                acc = svadd_f32_m(pg, acc, svld1_f32(pg, local_vals + t));
+                t += svcntw();
+                pg = svwhilelt_b32(t, n_lookups);
+            }
+            sink = svaddv_f32(svptrue_b32(), acc);
+        }
+
+        // PMU 计数器（累计 ITERS 次迭代）
+        PerfCounter pc_l1_acc(ArmPmu::L1D_CACHE);
+        PerfCounter pc_l1_miss(ArmPmu::L1D_CACHE_REFILL);
+        bool perf_ok = pc_l1_acc.ok() && pc_l1_miss.ok();
+        if (perf_ok) {
+            pc_l1_acc.reset(); pc_l1_acc.enable();
+            pc_l1_miss.reset(); pc_l1_miss.enable();
+        }
+
+        // 正式测量：20000 次，计算平均时间
+        double sum_us = 0;
+        for (int iter = 0; iter < ITERS; ++iter) {
+            auto t0 = high_resolution_clock::now();
+
+            for (int i = 0; i < n_lookups; ++i) {
+                int idx = a_vals[i] * TABLE_B + b_vals[i];
+                uint32_t bits = (uint32_t)sub[idx] << 16;
+                memcpy(&local_vals[i], &bits, 4);
+            }
+            svfloat32_t acc = svdup_n_f32(0.0f);
+            int t = 0;
+            svbool_t pg = svwhilelt_b32(t, n_lookups);
+            while (svptest_any(svptrue_b32(), pg)) {
+                acc = svadd_f32_m(pg, acc, svld1_f32(pg, local_vals + t));
+                t += svcntw();
+                pg = svwhilelt_b32(t, n_lookups);
+            }
+            sink = svaddv_f32(svptrue_b32(), acc);
+
+            auto t1 = high_resolution_clock::now();
+            sum_us += duration_cast<nanoseconds>(t1 - t0).count() / 1000.0;
+        }
+
+        if (perf_ok) {
+            pc_l1_acc.disable();
+            pc_l1_miss.disable();
+        }
+
+        double avg_us = sum_us / ITERS;
+        double avg_ns_total = avg_us * 1000;     // 总查表时间 (ns)
+        double avg_ns_each = avg_ns_total / n_lookups;  // 每次查表 (ns)
+
+        // L1-miss%
+        std::string s_l1mr = "—";
+        if (perf_ok) {
+            uint64_t l1_a = pc_l1_acc.read();
+            uint64_t l1_m = pc_l1_miss.read();
+            if (l1_a > 0) {
+                double rate = 100.0 * l1_m / l1_a;
+                std::ostringstream ss;
+                ss << std::fixed << std::setprecision(2) << rate << "%";
+                s_l1mr = ss.str();
+            }
+        }
 
         std::cout << std::left
                   << std::setw(16) << (std::to_string(table_a) + "×256").c_str()
-                  << std::setw(14) << entries
-                  << std::setw(12) << kib
-                  << std::setw(14) << std::fixed << std::setprecision(4) << min_us
-                  << std::setw(16) << std::fixed << std::setprecision(2) << ns_per_lookup
-                  << std::setw(14) << ("~" + std::to_string(cyc_per_lookup))
+                  << std::setw(14) << kib
+                  << std::setw(14) << n_lookups
+                  << std::setw(16) << std::fixed << std::setprecision(4) << avg_us
+                  << std::setw(14) << std::fixed << std::setprecision(2) << avg_ns_total
+                  << std::setw(14) << std::fixed << std::setprecision(2) << avg_ns_each
+                  << std::setw(14) << s_l1mr
                   << "\n";
     }
-    std::cout << std::string(85, '-') << "\n";
+    std::cout << std::string(100, '-') << "\n";
 }
 
 // ====================== Main ======================
