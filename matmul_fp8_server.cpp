@@ -1158,6 +1158,179 @@ void exp9_matrix_load_microbench() {
     std::cout << "\n";
 }
 
+// ====================== 实验10：纯查表微基准（预计算索引，无索引计算开销） ======================
+
+/**
+ * 实验10：在实验7的基础上，将索引对 (a,b) 改为预计算好的索引数组。
+ *
+ * 与实验7的区别：
+ *   实验7标量相位： idx = a_vals[i] * TABLE_B + b_vals[i]  （含乘+加索引计算）
+ *   实验10标量相位： local_vals[i] = sub[indices[i]]        （纯查表，无索引计算）
+ *
+ * 对比实验7即可测得索引计算开销。
+ *
+ * @param n_lookups  查表次数（默认 0 表示按实验7规则自动计算）
+ */
+void exp10_pure_lookup_microbench(int n_lookups_user = 0) {
+    std::cout << "\n" << std::string(70, '=') << "\n";
+    std::cout << "实验10: 纯查表微基准 — 预计算索引 (无索引计算开销)\n";
+    std::cout << std::string(70, '=') << "\n";
+    std::cout << "与实验7区别: 索引预计算，标量相位仅含 BF16 查表 + 转 float\n";
+    std::cout << "对比实验7的标量相位即可测得索引计算 ((a)*256+(b)) 的开销\n\n";
+
+    constexpr int TABLE_B = 256;
+    constexpr int MAX_LOOKUPS = 128;
+    constexpr int TABLE_A_VALS[] = {2, 4, 8, 16, 32};
+    constexpr int WARMUP = 2000;
+    constexpr int ITERS = 20000;
+
+    // 输出表头（与实验7格式一致，添加 "无索引计算" 标识）
+    std::cout << std::left
+              << std::setw(16) << "表维度"
+              << std::setw(14) << "表大小(KiB)"
+              << std::setw(14) << "查表次数"
+              << std::setw(16) << "平均耗时(μs)"
+              << std::setw(14) << "总查表(ns)"
+              << std::setw(14) << "每次查表(ns)"
+              << std::setw(14) << "L1-miss%"
+              << std::setw(14) << "标量(μs)"
+              << std::setw(14) << "SVE累加(μs)"
+              << std::setw(14) << "归约(μs)"
+              << std::setw(16) << "标量vs实验7"
+              << "\n" << std::string(156, '-') << "\n";
+
+    alignas(64) float local_vals[MAX_LOOKUPS];
+    alignas(64) uint32_t indices[MAX_LOOKUPS];  // 预计算索引
+
+    for (int table_a : TABLE_A_VALS) {
+        int entries = table_a * TABLE_B;
+        int kib = entries * 2 / 1024;   // BF16 2B/entry
+        // 用户指定 n_lookups 则使用用户值，否则按实验7规则
+        int n_lookups = (n_lookups_user > 0) ? n_lookups_user
+                                             : (MAX_LOOKUPS / (table_a / 2));
+
+        // 构建 BF16 表
+        std::vector<uint16_t> sub(entries);
+        for (int a = 0; a < table_a; ++a)
+            for (int b = 0; b < TABLE_B; ++b)
+                sub[a * TABLE_B + b] = float_to_bf16(sinf(a * 0.1f) * cosf(b * 0.1f));
+
+        // 预计算索引数组：indices[i] = rand() % entries
+        for (int i = 0; i < n_lookups; ++i)
+            indices[i] = rand() % entries;
+
+        volatile float sink = 0;
+
+        // Warmup
+        for (int w = 0; w < WARMUP; ++w) {
+            for (int i = 0; i < n_lookups; ++i) {
+                uint32_t bits = (uint32_t)sub[indices[i]] << 16;
+                memcpy(&local_vals[i], &bits, 4);
+            }
+            svfloat32_t acc = svdup_n_f32(0.0f);
+            int t = 0;
+            svbool_t pg = svwhilelt_b32(t, n_lookups);
+            while (svptest_any(svptrue_b32(), pg)) {
+                acc = svadd_f32_m(pg, acc, svld1_f32(pg, local_vals + t));
+                t += svcntw();
+                pg = svwhilelt_b32(t, n_lookups);
+            }
+            sink = svaddv_f32(svptrue_b32(), acc);
+        }
+
+        // PMU 计数器
+        PerfCounter pc_l1_acc(ArmPmu::L1D_CACHE);
+        PerfCounter pc_l1_miss(ArmPmu::L1D_CACHE_REFILL);
+        bool perf_ok = pc_l1_acc.ok() && pc_l1_miss.ok();
+        if (perf_ok) {
+            pc_l1_acc.reset(); pc_l1_acc.enable();
+            pc_l1_miss.reset(); pc_l1_miss.enable();
+        }
+
+        // 正式测量：分阶段计时
+        double sum_total = 0, sum_scalar = 0, sum_sve_acc = 0, sum_sve_reduce = 0;
+        for (int iter = 0; iter < ITERS; ++iter) {
+            auto t0 = high_resolution_clock::now();
+
+            // 阶段1: 纯查表（无索引计算）
+            for (int i = 0; i < n_lookups; ++i) {
+                uint32_t bits = (uint32_t)sub[indices[i]] << 16;
+                memcpy(&local_vals[i], &bits, 4);
+            }
+            auto t1 = high_resolution_clock::now();
+
+            // 阶段2: SVE 向量化累加
+            svfloat32_t acc = svdup_n_f32(0.0f);
+            int t = 0;
+            svbool_t pg = svwhilelt_b32(t, n_lookups);
+            while (svptest_any(svptrue_b32(), pg)) {
+                acc = svadd_f32_m(pg, acc, svld1_f32(pg, local_vals + t));
+                t += svcntw();
+                pg = svwhilelt_b32(t, n_lookups);
+            }
+            auto t2 = high_resolution_clock::now();
+
+            // 阶段3: SVE 归约
+            sink = svaddv_f32(svptrue_b32(), acc);
+            auto t3 = high_resolution_clock::now();
+
+            sum_scalar   += duration_cast<nanoseconds>(t1 - t0).count() / 1000.0;
+            sum_sve_acc  += duration_cast<nanoseconds>(t2 - t1).count() / 1000.0;
+            sum_sve_reduce += duration_cast<nanoseconds>(t3 - t2).count() / 1000.0;
+            sum_total    += duration_cast<nanoseconds>(t3 - t0).count() / 1000.0;
+        }
+
+        if (perf_ok) {
+            pc_l1_acc.disable();
+            pc_l1_miss.disable();
+        }
+
+        double avg_us = sum_total / ITERS;
+        double avg_ns_total = avg_us * 1000;
+        double avg_ns_each = avg_ns_total / n_lookups;
+        double avg_scalar_us = sum_scalar / ITERS;
+        double avg_sve_acc_us = sum_sve_acc / ITERS;
+        double avg_sve_reduce_us = sum_sve_reduce / ITERS;
+
+        // L1-miss%
+        std::string s_l1mr = "—";
+        if (perf_ok) {
+            uint64_t l1_a = pc_l1_acc.read();
+            uint64_t l1_m = pc_l1_miss.read();
+            if (l1_a > 0) {
+                double rate = 100.0 * l1_m / l1_a;
+                std::ostringstream ss;
+                ss << std::fixed << std::setprecision(2) << rate << "%";
+                s_l1mr = ss.str();
+            }
+        }
+
+        std::cout << std::left
+                  << std::setw(16) << (std::to_string(table_a) + "×256").c_str()
+                  << std::setw(14) << kib
+                  << std::setw(14) << n_lookups
+                  << std::setw(16) << std::fixed << std::setprecision(4) << avg_us
+                  << std::setw(14) << std::fixed << std::setprecision(2) << avg_ns_total
+                  << std::setw(14) << std::fixed << std::setprecision(2) << avg_ns_each
+                  << std::setw(14) << s_l1mr
+                  << std::setw(14) << std::fixed << std::setprecision(4) << avg_scalar_us
+                  << std::setw(14) << std::fixed << std::setprecision(4) << avg_sve_acc_us
+                  << std::setw(14) << std::fixed << std::setprecision(4) << avg_sve_reduce_us
+                  << std::setw(16) << "—"  // 手动对比
+                  << "\n";
+    }
+    std::cout << std::string(156, '-') << "\n";
+    std::cout << "注: \"标量vs实验7\" 列需手动对比实验7输出。\n";
+    std::cout << "    实验10标量相位 = 纯查表 | 实验7标量相位 = 查表 + 索引计算\n";
+    std::cout << "    两者差值 = 索引计算 (a*256+b) 的开销\n";
+
+    // 如有用户指定 n_lookups 参数，打印提示
+    if (n_lookups_user > 0)
+        std::cout << "    使用外部传入的查表次数: " << n_lookups_user << "\n";
+    std::cout << "\n";
+}
+
+
 // ====================== Main ======================
 
 int main(int argc, char *argv[]) {
@@ -1208,6 +1381,15 @@ int main(int argc, char *argv[]) {
     // 实验9: 矩阵加载对查表微基准的影响
     if (!only_exp || only_exp == 9)
         exp9_matrix_load_microbench();
+
+    // 实验10: 纯查表微基准（预计算索引）
+    // 默认 n_lookups=0 表示按实验7规则自动计算
+    // 也可由命令行参数指定：./fp8_server 10 <n_lookups>
+    if (!only_exp || only_exp == 10) {
+        int n_lookups = 0;
+        if (argc >= 3) n_lookups = atoi(argv[2]);
+        exp10_pure_lookup_microbench(n_lookups);
+    }
 
     std::cout << "\n测试完成!\n";
     return 0;
