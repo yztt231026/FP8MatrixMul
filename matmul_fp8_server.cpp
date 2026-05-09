@@ -1084,7 +1084,7 @@ void exp7_single_core_l1_lookup() {
  * SVE 向量化累加 + 归约。无 atomic。
  */
 void lookup_two_level_omp(const GroupData &data,
-                           const std::vector<std::vector<uint16_t>> &subtables,
+                           const std::vector<std::vector<float>> &subtables,
                            const uint8_t *B_T, float *C,
                            int N, int S, int L,
                            float *core_times, float &sync_time) {
@@ -1113,24 +1113,22 @@ void lookup_two_level_omp(const GroupData &data,
                     const uint8_t *a_ptr = data.A_grouped.data() + start;
                     const int *k_ptr = data.k_indices.data() + start;
                     const uint8_t *b_row = B_T + j * L;
-                    const uint16_t *sub = subtables[g].data();
+                    const float *sub = subtables[g].data();
                     int base = g * step;
 
-                    // 标量查表 + 转换 + SVE 累加，按向量宽度分块流式处理
+                    // 阶段1（标量）：计算子表索引
+                    alignas(64) uint32_t idx_buf[512];
+                    for (int t = 0; t < cnt; ++t)
+                        idx_buf[t] = (uint32_t)(a_ptr[t] - base) * 256u + b_row[k_ptr[t]];
+
+                    // 阶段2（SVE）：gather + 累加 + 归约
                     svfloat32_t acc = svdup_n_f32(0.0f);
                     int t = 0;
                     svbool_t pg = svwhilelt_b32(t, cnt);
                     while (svptest_any(svptrue_b32(), pg)) {
-                        alignas(32) float chunk[8];
-                        int n = svcntw();
-                        for (int tt = 0; tt < n && t + tt < cnt; ++tt) {
-                            int b_val = b_row[k_ptr[t + tt]];
-                            int idx = (a_ptr[t + tt] - base) * 256 + b_val;
-                            uint32_t bits = (uint32_t)sub[idx] << 16;
-                            memcpy(chunk + tt, &bits, 4);
-                        }
-                        acc = svadd_f32_m(pg, acc, svld1_f32(pg, chunk));
-                        t += n;
+                        acc = svadd_f32_m(pg, acc,
+                            svld1_gather_u32index_f32(pg, sub, svld1_u32(pg, idx_buf + t)));
+                        t += svcntw();
                         pg = svwhilelt_b32(t, cnt);
                     }
                     sum += svaddv_f32(svptrue_b32(), acc);
@@ -1158,8 +1156,8 @@ void exp8_two_level_lookup(const float *table, const uint8_t *A,
     std::cout << "实验8: BF16 子表 + 行并行 (G=" << G << "), 逐步增加核数\n";
     std::cout << std::string(70, '=') << "\n";
     std::cout << "矩阵: " << N << "x" << L << " * " << S << "x" << L << "^T\n";
-    std::cout << "子表格式: BF16 (2B), G=" << G << ", 细表 " << step << "x256x2 = "
-              << (step * 256 * 2 / 1024) << " KiB (L1)\n";
+    std::cout << "子表格式: float (4B, BF16精度), G=" << G << ", 细表 " << step << "x256x4 = "
+              << (step * 256 * 4 / 1024) << " KiB (L1), SVE gather\n";
     std::cout << "Warmup=" << WARMUP << ", 采样=" << ITERS << "\n\n";
 
     auto gops = [&](double us) { return double(N) * S * L / us / 1e3; };
@@ -1180,8 +1178,8 @@ void exp8_two_level_lookup(const float *table, const uint8_t *A,
     // ——— 预处理（G=4 固定，仅一次） ———
     double t_prep = omp_get_wtime();
     GroupData gd = preprocess_groups(A, N, L, G);
-    std::vector<std::vector<uint16_t>> subtables;
-    build_subtables_bf16(G, subtables, table);
+    std::vector<std::vector<float>> subtables;
+    build_subtables_bf16_float(G, subtables, table);
     double prep_us = (omp_get_wtime() - t_prep) * 1e6;
     std::cout << "预处理: " << std::fixed << std::setprecision(1) << prep_us << " us\n\n";
 
