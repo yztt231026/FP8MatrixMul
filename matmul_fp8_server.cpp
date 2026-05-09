@@ -260,11 +260,8 @@ void lookup_sve_grouped_omp(const GroupData &data,
                             const std::vector<std::vector<uint16_t>> &subtables,
                             const uint8_t *B_T, float *C,
                             int N, int S, int L,
-                            float *core_times, float &sync_time,
-                            float *scalar_times = nullptr,
-                            float *sve_times = nullptr) {
+                            float *core_times, float &sync_time) {
     int G = data.G, step = data.step;
-    bool want_phase = (scalar_times || sve_times);
 
     #pragma omp parallel num_threads(G)
     {
@@ -273,7 +270,6 @@ void lookup_sve_grouped_omp(const GroupData &data,
         int base = g * step;
 
         double t0 = omp_get_wtime();
-        double t_scalar = 0, t_sve = 0;
 
         for (int i = 0; i < N; ++i) {
             int start = data.row_start[i * G + g];
@@ -284,39 +280,30 @@ void lookup_sve_grouped_omp(const GroupData &data,
             for (int j = 0; j < S; ++j) {
                 const uint8_t *b_row = B_T + j * L;
 
-                double ts0 = 0;
-                if (want_phase) ts0 = omp_get_wtime();
-                // 阶段1：标量收集 B_T + BF16 子表查表 + 转 float
-                alignas(64) float local_vals[512];
-                for (int t = 0; t < count; ++t) {
-                    int b_val = b_row[k_ptr[t]];
-                    int idx = (a_ptr[t] - base) * 256 + b_val;
-                    uint32_t bits = (uint32_t)sub[idx] << 16;
-                    memcpy(local_vals + t, &bits, 4);
-                }
-                if (want_phase) t_scalar += omp_get_wtime() - ts0;
-
-                double ts1 = 0;
-                if (want_phase) ts1 = omp_get_wtime();
-                // 阶段2：SVE 向量化累加 + atomic
+                // 标量查表 + 转换 + SVE 累加，按向量宽度分块流式处理
                 svfloat32_t acc = svdup_n_f32(0.0f);
                 int t = 0;
                 svbool_t pg = svwhilelt_b32(t, count);
                 while (svptest_any(svptrue_b32(), pg)) {
-                    acc = svadd_f32_m(pg, acc, svld1_f32(pg, local_vals + t));
-                    t += svcntw();
+                    alignas(32) float chunk[8];
+                    int n = svcntw();
+                    for (int tt = 0; tt < n && t + tt < count; ++tt) {
+                        int b_val = b_row[k_ptr[t + tt]];
+                        int idx = (a_ptr[t + tt] - base) * 256 + b_val;
+                        uint32_t bits = (uint32_t)sub[idx] << 16;
+                        memcpy(chunk + tt, &bits, 4);
+                    }
+                    acc = svadd_f32_m(pg, acc, svld1_f32(pg, chunk));
+                    t += n;
                     pg = svwhilelt_b32(t, count);
                 }
                 #pragma omp atomic
                 C[i * S + j] += svaddv_f32(svptrue_b32(), acc);
-                if (want_phase) t_sve += omp_get_wtime() - ts1;
             }
         }
 
         double t1 = omp_get_wtime();
         core_times[g] = (t1 - t0) * 1e6;
-        if (scalar_times) scalar_times[g] = t_scalar * 1e6;
-        if (sve_times)    sve_times[g]    = t_sve * 1e6;
 
         #pragma omp barrier
         #pragma omp master
