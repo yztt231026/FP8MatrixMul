@@ -231,6 +231,42 @@ namespace ArmPmu {
     constexpr uint64_t L2D_CACHE_REFILL = 0x17;  // L2 data cache refill
 }
 
+/** 循环计数器：通过 perf_event_open 读取 CPU_CYCLES */
+class CycleCounter {
+    int fd_ = -1;
+
+    static long sys_open(struct perf_event_attr *pea, pid_t pid, int cpu,
+                         int group_fd, unsigned long flags) {
+        return syscall(__NR_perf_event_open, pea, pid, cpu, group_fd, flags);
+    }
+
+public:
+    CycleCounter() {
+        struct perf_event_attr pea{};
+        pea.type = PERF_TYPE_HARDWARE;
+        pea.size = sizeof(pea);
+        pea.config = PERF_COUNT_HW_CPU_CYCLES;
+        pea.disabled = 1;
+        pea.pinned = 1;
+        pea.exclude_kernel = 1;
+        pea.exclude_hv = 1;
+        fd_ = sys_open(&pea, 0, -1, -1, 0);
+    }
+    ~CycleCounter() { if (fd_ >= 0) close(fd_); }
+    bool ok() const { return fd_ >= 0; }
+    void start()  { if (fd_ >= 0) { reset(); enable(); } }
+    void stop()   { if (fd_ >= 0) disable(); }
+    uint64_t read() {
+        uint64_t val = 0;
+        if (fd_ >= 0 && ::read(fd_, &val, sizeof(val)) == sizeof(val)) return val;
+        return 0;
+    }
+private:
+    void enable()  { if (fd_ >= 0) ioctl(fd_, PERF_EVENT_IOC_ENABLE, 0); }
+    void disable() { if (fd_ >= 0) ioctl(fd_, PERF_EVENT_IOC_DISABLE, 0); }
+    void reset()   { if (fd_ >= 0) ioctl(fd_, PERF_EVENT_IOC_RESET, 0); }
+};
+
 // ====================== 实验6：L1 分组建表查表 (BF16 子表) ======================
 
 /** float → BF16 (取 float32 的高 16 位) */
@@ -1982,6 +2018,348 @@ void exp12_lookup_phase_bench() {
 }
 
 
+// ====================== 实验13：原语操作 cycle 微基准 ======================
+
+void exp13_primitive_cycle_bench() {
+    constexpr int WARMUP = 100;
+    constexpr int NLOOP = 2000;       // Part 1/3: 内层循环重复
+    constexpr int NLOOP_FAST = 50000; // Part 2:  快速操作重复
+    constexpr int NLOOP_MID = 10000;  // Part 2b: 中等速度操作重复
+    constexpr int NLOOP_PREP = 200;   // Part 4:  预处理重复
+
+    volatile float sink_f = 0;
+    volatile uint32_t sink_u = 0;
+
+    auto cyc_per = [&](auto fn, int warm, int repeat) -> double {
+        for (int w = 0; w < warm; ++w) fn();
+        CycleCounter cc;
+        if (!cc.ok()) return -1;
+        cc.start();
+        for (int r = 0; r < repeat; ++r) fn();
+        cc.stop();
+        return (double)cc.read() / repeat;
+    };
+
+    std::cout << "\n" << std::string(70, '=') << "\n";
+    std::cout << "实验13: 原语操作 cycle 微基准\n";
+    std::cout << std::string(70, '=') << "\n";
+    std::cout << "平台: Kunpeng, svcntw()=" << svcntw()
+              << ", L1d=" << L1D_KiB << "KiB, L2=" << L2_KiB << "KiB\n";
+    std::cout << "测量: CPU_CYCLES via perf_event_open, " << NLOOP << "~" << NLOOP_FAST << " 次取平均\n\n";
+
+    // ======== 准备数据 ========
+    // float 表
+    std::vector<float> tab_l1(1024);         // 4 KiB  (L1)
+    std::vector<float> tab_l2(65536);        // 256 KiB (L2)
+    for (int i = 0; i < (int)tab_l1.size(); ++i) tab_l1[i] = sinf(i * 0.01f);
+    for (int i = 0; i < (int)tab_l2.size(); ++i) tab_l2[i] = cosf(i * 0.01f);
+
+    // uint16_t 表（模拟 BF16 子表，2B/entry）
+    std::vector<uint16_t> tab_u16(1024);
+    for (int i = 0; i < (int)tab_u16.size(); ++i) tab_u16[i] = (uint16_t)(i & 0xFFFF);
+
+    // 索引
+    constexpr int MAX_IDX = 512;
+    std::vector<uint32_t> seq_idx(MAX_IDX), rnd_idx_l1(MAX_IDX), rnd_idx_l2(MAX_IDX);
+    for (int i = 0; i < MAX_IDX; ++i) {
+        seq_idx[i] = i;
+        rnd_idx_l1[i] = rand() % tab_l1.size();
+        rnd_idx_l2[i] = rand() % tab_l2.size();
+    }
+
+    // uint8_t 源数据（模拟 A/B_T 的 8-bit 值域）
+    std::vector<uint8_t> a_vals(MAX_IDX), b_vals(MAX_IDX);
+    for (int i = 0; i < MAX_IDX; ++i) {
+        a_vals[i] = rand() % 256;
+        b_vals[i] = rand() % 256;
+    }
+
+    auto bench_row = [&](const std::string &name, uint64_t total_cyc,
+                         int repeat, int elements_per_call) -> void {
+        std::cout << std::left << std::setw(24) << name;
+        if (total_cyc == 0) {
+            std::cout << std::setw(14) << "N/A" << std::setw(16) << "N/A\n";
+        } else {
+            double per_elem = (double)total_cyc / (repeat * elements_per_call);
+            std::cout << std::setw(14) << total_cyc
+                      << std::setw(16) << std::fixed << std::setprecision(2) << per_elem << "\n";
+        }
+    };
+
+    // ——————————————————————————————
+    // Part 1: 标量 vs SVE load/store
+    // ——————————————————————————————
+    std::cout << "— Part 1: 标量 vs SVE load/store (L1/L2 查表) —\n";
+    std::cout << std::left
+              << std::setw(24) << "模式"
+              << std::setw(14) << "总cycles"
+              << std::setw(16) << "每元素cycles"
+              << "\n" << std::string(54, '-') << "\n";
+
+    constexpr int LOOKUPS[]   = {128, 512};
+    const char *TAB_NAMES[]   = {"L1(4KiB)", "L2(256KiB)"};
+
+    for (int ti = 0; ti < 2; ++ti) {
+        const float *tab = (ti == 0) ? tab_l1.data() : tab_l2.data();
+        const uint32_t *ridx = (ti == 0) ? rnd_idx_l1.data() : rnd_idx_l2.data();
+
+        for (int li = 0; li < 2; ++li) {
+            int n = LOOKUPS[li];
+            std::string pfx = std::string(TAB_NAMES[ti]) + " ";
+
+            // 1a. 标量顺序
+            auto fn_scalar_seq = [&]() {
+                float sum = 0;
+                for (int i = 0; i < n; ++i) sum += tab[i];
+                sink_f += sum;
+            };
+            double cyc = cyc_per(fn_scalar_seq, WARMUP, NLOOP);
+            bench_row(pfx + "标量顺序(" + std::to_string(n) + ")",
+                      cyc > 0 ? (uint64_t)(cyc * NLOOP) : 0, NLOOP, n);
+
+            // 1b. SVE 顺序 (svld1_f32 + svadd_f32_m)
+            auto fn_sve_seq = [&]() {
+                svfloat32_t acc = svdup_n_f32(0.0f);
+                int i = 0;
+                svbool_t pg = svwhilelt_b32(i, n);
+                while (svptest_any(svptrue_b32(), pg)) {
+                    acc = svadd_f32_m(pg, acc, svld1_f32(pg, tab + i));
+                    i += svcntw();
+                    pg = svwhilelt_b32(i, n);
+                }
+                sink_f += svaddv_f32(svptrue_b32(), acc);
+            };
+            cyc = cyc_per(fn_sve_seq, WARMUP, NLOOP);
+            bench_row(pfx + "SVE顺序(" + std::to_string(n) + ")",
+                      cyc > 0 ? (uint64_t)(cyc * NLOOP) : 0, NLOOP, n);
+
+            // 1c. 标量 gather
+            auto fn_scalar_gather = [&]() {
+                float sum = 0;
+                for (int t = 0; t < n; ++t) sum += tab[ridx[t]];
+                sink_f += sum;
+            };
+            cyc = cyc_per(fn_scalar_gather, WARMUP, NLOOP);
+            bench_row(pfx + "标量gather(" + std::to_string(n) + ")",
+                      cyc > 0 ? (uint64_t)(cyc * NLOOP) : 0, NLOOP, n);
+
+            // 1d. SVE gather (svld1_gather_u32index_f32)
+            auto fn_sve_gather = [&]() {
+                svfloat32_t acc = svdup_n_f32(0.0f);
+                int t = 0;
+                svbool_t pg = svwhilelt_b32(t, n);
+                while (svptest_any(svptrue_b32(), pg)) {
+                    acc = svadd_f32_m(pg, acc,
+                        svld1_gather_u32index_f32(pg, tab, svld1_u32(pg, ridx + t)));
+                    t += svcntw();
+                    pg = svwhilelt_b32(t, n);
+                }
+                sink_f += svaddv_f32(svptrue_b32(), acc);
+            };
+            cyc = cyc_per(fn_sve_gather, WARMUP, NLOOP);
+            bench_row(pfx + "SVE gather(" + std::to_string(n) + ")",
+                      cyc > 0 ? (uint64_t)(cyc * NLOOP) : 0, NLOOP, n);
+
+            // 1e. 旧 chunk 方式 (仅 L1): uint16_t load + shift + store + svld1
+            if (ti == 0) {
+                auto fn_chunk = [&]() {
+                    svfloat32_t acc = svdup_n_f32(0.0f);
+                    int t = 0;
+                    svbool_t pg = svwhilelt_b32(t, n);
+                    while (svptest_any(svptrue_b32(), pg)) {
+                        alignas(32) float chunk[8];
+                        int nv = svcntw();
+                        for (int tt = 0; tt < nv && t + tt < n; ++tt) {
+                            uint32_t bits = (uint32_t)tab_u16[ridx[t + tt]] << 16;
+                            memcpy(chunk + tt, &bits, 4);
+                        }
+                        acc = svadd_f32_m(pg, acc, svld1_f32(pg, chunk));
+                        t += nv;
+                        pg = svwhilelt_b32(t, n);
+                    }
+                    sink_f += svaddv_f32(svptrue_b32(), acc);
+                };
+                cyc = cyc_per(fn_chunk, WARMUP, NLOOP);
+                bench_row(pfx + "BF16chunk(" + std::to_string(n) + ")",
+                          cyc > 0 ? (uint64_t)(cyc * NLOOP) : 0, NLOOP, n);
+            }
+        }
+    }
+    std::cout << "\n";
+
+    // ——————————————————————————————
+    // Part 2: SVE sumup (归约)
+    // ——————————————————————————————
+    std::cout << "— Part 2: SVE sumup (归约) —\n";
+    std::cout << std::left
+              << std::setw(24) << "模式"
+              << std::setw(14) << "总cycles"
+              << std::setw(16) << "每向量cycles"
+              << "\n" << std::string(54, '-') << "\n";
+
+    // 2a. 单次 svaddv_f32
+    {
+        auto fn = [&]() {
+            svfloat32_t v = svdup_n_f32((float)(sink_f));
+            sink_f += svaddv_f32(svptrue_b32(), v);
+        };
+        double cyc = cyc_per(fn, WARMUP * 2, NLOOP_FAST);
+        bench_row("svaddv_f32 (1vec)",
+                  cyc > 0 ? (uint64_t)(cyc * NLOOP_FAST) : 0, NLOOP_FAST, 1);
+    }
+
+    // 2b-e. N 次 svadd_f32_m + svaddv_f32
+    constexpr int ACC_CHAINS[] = {1, 4, 16, 64};
+    for (int nv : ACC_CHAINS) {
+        if (nv == 1) continue; // 已在 2a 中测量
+        auto fn = [&]() {
+            svfloat32_t acc = svdup_n_f32(0.0f);
+            for (int i = 0; i < nv; ++i) {
+                svfloat32_t v = svdup_n_f32((float)(sink_f * (i + 1)));
+                acc = svadd_f32_m(svptrue_b32(), acc, v);
+            }
+            sink_f += svaddv_f32(svptrue_b32(), acc);
+        };
+        int rep = (nv <= 4) ? NLOOP_MID : NLOOP;
+        double cyc = cyc_per(fn, WARMUP, rep);
+        bench_row("svadd_f32_m×" + std::to_string(nv) + "+归约",
+                  cyc > 0 ? (uint64_t)(cyc * rep) : 0, rep, nv + 1);
+    }
+    std::cout << "\n";
+
+    // ——————————————————————————————
+    // Part 3: 索引构建 (左移+or)
+    // ——————————————————————————————
+    std::cout << "— Part 3: 索引构建 (左移+or) —\n";
+    std::cout << std::left
+              << std::setw(24) << "模式"
+              << std::setw(14) << "总cycles"
+              << std::setw(16) << "每索引cycles"
+              << "\n" << std::string(54, '-') << "\n";
+
+    alignas(64) uint32_t idx_buf[MAX_IDX];
+    for (int n : {128, 512}) {
+        // 3a. 标量 idx = (a << 8) | b
+        auto fn_scalar = [&]() {
+            for (int t = 0; t < n; ++t)
+                idx_buf[t] = ((uint32_t)a_vals[t] << 8) | b_vals[t];
+            sink_u += idx_buf[0];
+        };
+        double cyc = cyc_per(fn_scalar, WARMUP, NLOOP);
+        bench_row("标量(a<<8)|b(" + std::to_string(n) + ")",
+                  cyc > 0 ? (uint64_t)(cyc * NLOOP) : 0, NLOOP, n);
+
+        // 3b. 标量 idx = (a - base) * 256 + b (含偏移)
+        int base = 64;
+        auto fn_scalar_off = [&]() {
+            for (int t = 0; t < n; ++t)
+                idx_buf[t] = (uint32_t)(a_vals[t] - base) * 256u + b_vals[t];
+            sink_u += idx_buf[0];
+        };
+        cyc = cyc_per(fn_scalar_off, WARMUP, NLOOP);
+        bench_row("标量(a-base)*256+b(" + std::to_string(n) + ")",
+                  cyc > 0 ? (uint64_t)(cyc * NLOOP) : 0, NLOOP, n);
+
+        // 3c. SVE: svorr(svlsl(svld1ub,8), svld1ub)
+        auto fn_sve_idx = [&]() {
+            int t = 0;
+            svbool_t pg = svwhilelt_b32(t, n);
+            while (svptest_any(svptrue_b32(), pg)) {
+                svuint32_t idx = svorr_u32_z(pg,
+                    svlsl_n_u32_z(pg, svld1ub_u32(pg, a_vals.data() + t), 8u),
+                    svld1ub_u32(pg, b_vals.data() + t));
+                svst1_u32(pg, idx_buf + t, idx);
+                t += svcntw();
+                pg = svwhilelt_b32(t, n);
+            }
+            sink_u += idx_buf[0];
+        };
+        cyc = cyc_per(fn_sve_idx, WARMUP, NLOOP);
+        bench_row("SVE向量索引(" + std::to_string(n) + ")",
+                  cyc > 0 ? (uint64_t)(cyc * NLOOP) : 0, NLOOP, n);
+    }
+    std::cout << "\n";
+
+    // ——————————————————————————————
+    // Part 4: 预处理重排
+    // ——————————————————————————————
+    std::cout << "— Part 4: 预处理重排 (G 值扫描，N=128, L=512) —\n";
+    std::cout << std::left
+              << std::setw(8) << "G"
+              << std::setw(16) << "计数总cycles"
+              << std::setw(16) << "填充总cycles"
+              << std::setw(18) << "计数每元素cycles"
+              << std::setw(18) << "填充每元素cycles"
+              << "\n" << std::string(76, '-') << "\n";
+
+    constexpr int PP_N = 128, PP_L = 512;
+    constexpr int G_VALS[] = {4, 8, 16, 32};
+
+    // 生成随机 A 矩阵
+    std::vector<uint8_t> A_pp(PP_N * PP_L);
+    for (int i = 0; i < PP_N * PP_L; ++i) A_pp[i] = rand() % 256;
+
+    for (int Gi : G_VALS) {
+        int step = 256 / Gi;
+        constexpr int NREPEAT_PP = 200;
+
+        // 预分配
+        std::vector<int> row_count(PP_N * Gi, 0);
+        std::vector<int> row_start(PP_N * Gi, 0);
+        std::vector<uint8_t> A_grouped(PP_N * PP_L);
+        std::vector<int> k_indices(PP_N * PP_L);
+
+        // 4a: 计数阶段 (仅 row_count)
+        auto fn_count = [&]() {
+            std::fill(row_count.begin(), row_count.end(), 0);
+            for (int i = 0; i < PP_N; ++i)
+                for (int k = 0; k < PP_L; ++k)
+                    row_count[i * Gi + A_pp[i * PP_L + k] / step]++;
+        };
+        double cyc_cnt = cyc_per(fn_count, 20, NREPEAT_PP);
+
+        // 提取 row_start (仅一次，填充阶段需要)
+        int total = 0;
+        for (int i = 0; i < PP_N; ++i)
+            for (int g = 0; g < Gi; ++g) {
+                row_start[i * Gi + g] = total;
+                total += row_count[i * Gi + g];
+            }
+
+        // 4b: 填充阶段 (A_grouped + k_indices)
+        auto fn_fill = [&]() {
+            std::vector<int> cursor(PP_N * Gi, 0);
+            for (int i = 0; i < PP_N; ++i)
+                for (int k = 0; k < PP_L; ++k) {
+                    int g = A_pp[i * PP_L + k] / step;
+                    int pos = row_start[i * Gi + g] + cursor[i * Gi + g];
+                    A_grouped[pos] = A_pp[i * PP_L + k];
+                    k_indices[pos] = k;
+                    cursor[i * Gi + g]++;
+                }
+        };
+        double cyc_fill = cyc_per(fn_fill, 20, NREPEAT_PP);
+
+        uint64_t t_cnt = cyc_cnt > 0 ? (uint64_t)(cyc_cnt * NREPEAT_PP) : 0;
+        uint64_t t_fil = cyc_fill > 0 ? (uint64_t)(cyc_fill * NREPEAT_PP) : 0;
+        int elems = PP_N * PP_L;
+
+        std::cout << std::left
+                  << std::setw(8) << Gi
+                  << std::setw(16) << t_cnt
+                  << std::setw(16) << t_fil
+                  << std::setw(18) << std::fixed << std::setprecision(2)
+                  << (cyc_cnt > 0 ? cyc_cnt / elems : -1)
+                  << std::setw(18) << std::fixed << std::setprecision(2)
+                  << (cyc_fill > 0 ? cyc_fill / elems : -1) << "\n";
+    }
+    std::cout << "\n";
+
+    std::cout << "注意: 总cycles为 perf 计数器累计值 (不精确到单次)。" << std::endl;
+    std::cout << "      每元素cycles = 总cycles / (重复次数 × 每批元素数)。" << std::endl;
+    std::cout << "      -1 表示 cycle 计数器打开失败 (非 ARM 平台)。" << std::endl;
+}
+
 // ====================== Main ======================
 
 int main(int argc, char *argv[]) {
@@ -2053,6 +2431,10 @@ int main(int argc, char *argv[]) {
     // 实验12: 索引计算微基准 (uint8→uint32, (a<<8)+b)
     if (!only_exp || only_exp == 12)
         exp12_lookup_phase_bench();
+
+    // 实验13: 原语操作 cycle 微基准
+    if (!only_exp || only_exp == 13)
+        exp13_primitive_cycle_bench();
 
     std::cout << "\n测试完成!\n";
     return 0;
