@@ -371,7 +371,7 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
     std::cout << std::string(70, '=') << "\n";
     std::cout << "矩阵: " << N << "×" << L << " * " << S << "×" << L << "^T\n";
     std::cout << "L1d = " << L1D_KiB << " KiB, 子表格式: BF16 (2B)\n";
-    std::cout << "Warmup=100, 采样=10000\n\n";
+    std::cout << "Warmup=100, 采样=1000\n\n";
 
     auto gops = [&](double us) { return double(N) * S * L / us / 1e3; };
 
@@ -394,7 +394,7 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
         bf16_u16[i] = float_to_bf16(table[i]);
 
     constexpr int WARMUP = 100;
-    constexpr int ITERS = 10000;
+    constexpr int ITERS = 1000;
 
     std::vector<float> C_bl(N * S);
 
@@ -436,6 +436,51 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
               << std::setw(10) << std::fixed << std::setprecision(2) << gops(bf16_sve_us)
               << std::setw(10) << (ok_sve ? "OK" : "FAIL") << "\n";
     std::cout << "  SVE 加速比: " << std::fixed << std::setprecision(2) << sve_speedup << "x\n\n";
+
+    // ——— float 单核基线 ———
+    std::cout << "— float 单核基线 (原表, 256 KiB, L2) —\n";
+    std::cout << std::left
+              << std::setw(14) << "方式"
+              << std::setw(16) << "总耗时(μs)"
+              << std::setw(10) << "GOP/s"
+              << std::setw(10) << "正确"
+              << "\n" << std::string(50, '-') << "\n";
+
+    // float 标量
+    for (int w = 0; w < WARMUP; ++w)
+        lookup_scalar(table, A, B_T, C_bl.data(), N, S, L);
+    t0 = omp_get_wtime();
+    for (int iter = 0; iter < ITERS; ++iter)
+        lookup_scalar(table, A, B_T, C_bl.data(), N, S, L);
+    double f32_scalar_us = (omp_get_wtime() - t0) * 1e6 / ITERS;
+    bool ok_f32_sca = verify(ref, C_bl.data(), N * S);
+
+    // float SVE（1 核）
+    omp_set_num_threads(1);
+    for (int w = 0; w < WARMUP; ++w) {
+        memset(C_bl.data(), 0, N * S * sizeof(float));
+        lookup_sve_omp(table, A, B_T, C_bl.data(), N, S, L);
+    }
+    t0 = omp_get_wtime();
+    for (int iter = 0; iter < ITERS; ++iter) {
+        memset(C_bl.data(), 0, N * S * sizeof(float));
+        lookup_sve_omp(table, A, B_T, C_bl.data(), N, S, L);
+    }
+    double f32_sve_us = (omp_get_wtime() - t0) * 1e6 / ITERS;
+    bool ok_f32_sve = verify(ref, C_bl.data(), N * S);
+    double f32_speedup = f32_scalar_us / f32_sve_us;
+
+    std::cout << std::left
+              << std::setw(14) << "float标量"
+              << std::setw(16) << std::fixed << std::setprecision(1) << f32_scalar_us
+              << std::setw(10) << std::fixed << std::setprecision(2) << gops(f32_scalar_us)
+              << std::setw(10) << (ok_f32_sca ? "OK" : "FAIL") << "\n";
+    std::cout << std::left
+              << std::setw(14) << "float SVE"
+              << std::setw(16) << std::fixed << std::setprecision(1) << f32_sve_us
+              << std::setw(10) << std::fixed << std::setprecision(2) << gops(f32_sve_us)
+              << std::setw(10) << (ok_f32_sve ? "OK" : "FAIL") << "\n";
+    std::cout << "  SVE 加速比: " << std::fixed << std::setprecision(2) << f32_speedup << "x\n\n";
 
     // ——— 输出表头 ———
     std::cout << std::left
@@ -604,6 +649,65 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
                   << std::setw(18) << ss_total.str()
                   << std::setw(12) << std::fixed << std::setprecision(1) << min_total
                   << std::setw(10) << std::fixed << std::setprecision(2) << gops_min
+                  << std::setw(10) << (ok ? "OK" : "FAIL") << "\n";
+    }
+    std::cout << "\n";
+}
+
+    // ——— float SVE 核数扫描 ———
+    constexpr int F32_CORES[] = {1, 2, 4, 8, 16, 32, 64};
+    std::cout << "— float SVE 核数扫描 (原表, 256 KiB, L2) —\n";
+    std::cout << std::left
+              << std::setw(8) << "核数"
+              << std::setw(16) << "总耗时mean±sd"
+              << std::setw(12) << "总耗时min"
+              << std::setw(10) << "GOP/s"
+              << std::setw(10) << "加速比"
+              << std::setw(10) << "正确"
+              << "\n" << std::string(66, '-') << "\n";
+
+    std::vector<float> C_f32(N * S);
+    double base_1core = 0;
+
+    for (int nc : F32_CORES) {
+        if (nc > num_threads) continue;
+        omp_set_num_threads(nc);
+
+        double sum_t = 0, sum_t2 = 0;
+        double min_t = 1e18;
+
+        for (int w = 0; w < WARMUP; ++w) {
+            memset(C_f32.data(), 0, N * S * sizeof(float));
+            lookup_sve_omp(table, A, B_T, C_f32.data(), N, S, L);
+        }
+        for (int iter = 0; iter < ITERS; ++iter) {
+            memset(C_f32.data(), 0, N * S * sizeof(float));
+            double t0 = omp_get_wtime();
+            lookup_sve_omp(table, A, B_T, C_f32.data(), N, S, L);
+            double t = (omp_get_wtime() - t0) * 1e6;
+            sum_t += t; sum_t2 += t * t;
+            if (t < min_t) min_t = t;
+        }
+
+        double mean_t = sum_t / ITERS;
+        double var_t = (sum_t2 - sum_t * mean_t) / (ITERS - 1);
+        double sd_t = std::sqrt(std::max(0.0, var_t));
+
+        bool ok = verify(ref, C_f32.data(), N * S);
+
+        if (nc == 1) base_1core = min_t;
+        double speedup = base_1core / min_t;
+
+        std::ostringstream ss;
+        ss << std::fixed << std::setprecision(1) << mean_t
+           << "±" << std::setprecision(1) << sd_t;
+
+        std::cout << std::left
+                  << std::setw(8) << nc
+                  << std::setw(16) << ss.str()
+                  << std::setw(12) << std::fixed << std::setprecision(1) << min_t
+                  << std::setw(10) << std::fixed << std::setprecision(2) << gops(min_t)
+                  << std::setw(10) << std::fixed << std::setprecision(2) << speedup << "x"
                   << std::setw(10) << (ok ? "OK" : "FAIL") << "\n";
     }
     std::cout << "\n";
