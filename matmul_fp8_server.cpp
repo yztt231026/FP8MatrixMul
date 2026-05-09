@@ -2090,14 +2090,17 @@ void exp13_primitive_cycle_bench() {
     // Part 1: 标量 vs SVE load/store
     // ——————————————————————————————
     std::cout << "— Part 1: 标量 vs SVE load/store (L1/L2 查表) —\n";
+    std::cout << "  标量: 每操作 = 1 次标量 load | SVE: 每操作 = 1 次 SVE load/gather (8元素)\n";
     std::cout << std::left
               << std::setw(24) << "模式"
               << std::setw(14) << "总cycles"
-              << std::setw(16) << "每元素cycles"
+              << std::setw(16) << "每操作cycles"
               << "\n" << std::string(54, '-') << "\n";
 
     constexpr int LOOKUPS[]   = {128, 512};
     const char *TAB_NAMES[]   = {"L1(4KiB)", "L2(256KiB)"};
+
+    int sve_ops_per_call(int n) { return n / svcntw(); }
 
     for (int ti = 0; ti < 2; ++ti) {
         const float *tab = (ti == 0) ? tab_l1.data() : tab_l2.data();
@@ -2105,9 +2108,10 @@ void exp13_primitive_cycle_bench() {
 
         for (int li = 0; li < 2; ++li) {
             int n = LOOKUPS[li];
+            int sv = sve_ops_per_call(n);
             std::string pfx = std::string(TAB_NAMES[ti]) + " ";
 
-            // 1a. 标量顺序
+            // 1a. 标量顺序 (n 次操作)
             auto fn_scalar_seq = [&]() {
                 float sum = 0;
                 for (int i = 0; i < n; ++i) sum += tab[i];
@@ -2117,7 +2121,7 @@ void exp13_primitive_cycle_bench() {
             bench_row(pfx + "标量顺序(" + std::to_string(n) + ")",
                       cyc > 0 ? (uint64_t)(cyc * NLOOP) : 0, NLOOP, n);
 
-            // 1b. SVE 顺序 (svld1_f32 + svadd_f32_m)
+            // 1b. SVE 顺序 (sv 次操作)
             auto fn_sve_seq = [&]() {
                 svfloat32_t acc = svdup_n_f32(0.0f);
                 int i = 0;
@@ -2131,9 +2135,9 @@ void exp13_primitive_cycle_bench() {
             };
             cyc = cyc_per(fn_sve_seq, WARMUP, NLOOP);
             bench_row(pfx + "SVE顺序(" + std::to_string(n) + ")",
-                      cyc > 0 ? (uint64_t)(cyc * NLOOP) : 0, NLOOP, n);
+                      cyc > 0 ? (uint64_t)(cyc * NLOOP) : 0, NLOOP, sv);
 
-            // 1c. 标量 gather
+            // 1c. 标量 gather (n 次操作)
             auto fn_scalar_gather = [&]() {
                 float sum = 0;
                 for (int t = 0; t < n; ++t) sum += tab[ridx[t]];
@@ -2143,7 +2147,7 @@ void exp13_primitive_cycle_bench() {
             bench_row(pfx + "标量gather(" + std::to_string(n) + ")",
                       cyc > 0 ? (uint64_t)(cyc * NLOOP) : 0, NLOOP, n);
 
-            // 1d. SVE gather (svld1_gather_u32index_f32)
+            // 1d. SVE gather (sv 次操作)
             auto fn_sve_gather = [&]() {
                 svfloat32_t acc = svdup_n_f32(0.0f);
                 int t = 0;
@@ -2158,9 +2162,9 @@ void exp13_primitive_cycle_bench() {
             };
             cyc = cyc_per(fn_sve_gather, WARMUP, NLOOP);
             bench_row(pfx + "SVE gather(" + std::to_string(n) + ")",
-                      cyc > 0 ? (uint64_t)(cyc * NLOOP) : 0, NLOOP, n);
+                      cyc > 0 ? (uint64_t)(cyc * NLOOP) : 0, NLOOP, sv);
 
-            // 1e. 旧 chunk 方式 (仅 L1): uint16_t load + shift + store + svld1
+            // 1e. 旧 chunk 方式 (仅 L1): uint16_t load + shift + store + svld1 (sv 次操作)
             if (ti == 0) {
                 auto fn_chunk = [&]() {
                     svfloat32_t acc = svdup_n_f32(0.0f);
@@ -2181,7 +2185,7 @@ void exp13_primitive_cycle_bench() {
                 };
                 cyc = cyc_per(fn_chunk, WARMUP, NLOOP);
                 bench_row(pfx + "BF16chunk(" + std::to_string(n) + ")",
-                          cyc > 0 ? (uint64_t)(cyc * NLOOP) : 0, NLOOP, n);
+                          cyc > 0 ? (uint64_t)(cyc * NLOOP) : 0, NLOOP, sv);
             }
         }
     }
@@ -2194,7 +2198,7 @@ void exp13_primitive_cycle_bench() {
     std::cout << std::left
               << std::setw(24) << "模式"
               << std::setw(14) << "总cycles"
-              << std::setw(16) << "每向量cycles"
+              << std::setw(16) << "每操作cycles"
               << "\n" << std::string(54, '-') << "\n";
 
     // 2a. 单次 svaddv_f32
@@ -2231,14 +2235,16 @@ void exp13_primitive_cycle_bench() {
     // Part 3: 索引构建 (左移+or)
     // ——————————————————————————————
     std::cout << "— Part 3: 索引构建 (左移+or) —\n";
+    std::cout << "  标量: 每操作 = 1 次索引计算 | SVE: 每操作 = 1 次向量化构建 (8索引)\n";
     std::cout << std::left
               << std::setw(24) << "模式"
               << std::setw(14) << "总cycles"
-              << std::setw(16) << "每索引cycles"
+              << std::setw(16) << "每操作cycles"
               << "\n" << std::string(54, '-') << "\n";
 
     alignas(64) uint32_t idx_buf[MAX_IDX];
     for (int n : {128, 512}) {
+        int sv_idx = n / svcntw();
         // 3a. 标量 idx = (a << 8) | b
         auto fn_scalar = [&]() {
             for (int t = 0; t < n; ++t)
@@ -2276,7 +2282,7 @@ void exp13_primitive_cycle_bench() {
         };
         cyc = cyc_per(fn_sve_idx, WARMUP, NLOOP);
         bench_row("SVE向量索引(" + std::to_string(n) + ")",
-                  cyc > 0 ? (uint64_t)(cyc * NLOOP) : 0, NLOOP, n);
+                  cyc > 0 ? (uint64_t)(cyc * NLOOP) : 0, NLOOP, sv_idx);
     }
     std::cout << "\n";
 
@@ -2288,8 +2294,8 @@ void exp13_primitive_cycle_bench() {
               << std::setw(8) << "G"
               << std::setw(16) << "计数总cycles"
               << std::setw(16) << "填充总cycles"
-              << std::setw(18) << "计数每元素cycles"
-              << std::setw(18) << "填充每元素cycles"
+              << std::setw(18) << "计数(cyc/op)"
+              << std::setw(18) << "填充(cyc/op)"
               << "\n" << std::string(76, '-') << "\n";
 
     constexpr int PP_N = 128, PP_L = 512;
@@ -2355,8 +2361,9 @@ void exp13_primitive_cycle_bench() {
     }
     std::cout << "\n";
 
-    std::cout << "注意: 总cycles为 perf 计数器累计值 (不精确到单次)。" << std::endl;
-    std::cout << "      每元素cycles = 总cycles / (重复次数 × 每批元素数)。" << std::endl;
+    std::cout << "注意: 总cycles为 perf 计数器累计值。" << std::endl;
+    std::cout << "      每操作cycles = 总cycles / (重复次数 × 每批操作数)。" << std::endl;
+    std::cout << "      标量: 1 操作 = 1 次 load/计算。SVE: 1 操作 = 1 条向量指令。" << std::endl;
     std::cout << "      -1 表示 cycle 计数器打开失败 (非 ARM 平台)。" << std::endl;
 }
 
