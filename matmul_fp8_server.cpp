@@ -264,6 +264,7 @@ void lookup_sve_grouped_omp(const GroupData &data,
                             float *scalar_times = nullptr,
                             float *sve_times = nullptr) {
     int G = data.G, step = data.step;
+    bool want_phase = (scalar_times || sve_times);
 
     #pragma omp parallel num_threads(G)
     {
@@ -271,8 +272,8 @@ void lookup_sve_grouped_omp(const GroupData &data,
         const uint16_t *sub = subtables[g].data();
         int base = g * step;
 
-        double t_scalar = 0, t_sve = 0;
         double t0 = omp_get_wtime();
+        double t_scalar = 0, t_sve = 0;
 
         for (int i = 0; i < N; ++i) {
             int start = data.row_start[i * G + g];
@@ -283,7 +284,8 @@ void lookup_sve_grouped_omp(const GroupData &data,
             for (int j = 0; j < S; ++j) {
                 const uint8_t *b_row = B_T + j * L;
 
-                double ts0 = omp_get_wtime();
+                double ts0 = 0;
+                if (want_phase) ts0 = omp_get_wtime();
                 // 阶段1：标量收集 B_T + BF16 子表查表 + 转 float
                 alignas(64) float local_vals[512];
                 for (int t = 0; t < count; ++t) {
@@ -292,9 +294,10 @@ void lookup_sve_grouped_omp(const GroupData &data,
                     uint32_t bits = (uint32_t)sub[idx] << 16;
                     memcpy(local_vals + t, &bits, 4);
                 }
-                t_scalar += omp_get_wtime() - ts0;
+                if (want_phase) t_scalar += omp_get_wtime() - ts0;
 
-                double ts1 = omp_get_wtime();
+                double ts1 = 0;
+                if (want_phase) ts1 = omp_get_wtime();
                 // 阶段2：SVE 向量化累加 + atomic
                 svfloat32_t acc = svdup_n_f32(0.0f);
                 int t = 0;
@@ -306,7 +309,7 @@ void lookup_sve_grouped_omp(const GroupData &data,
                 }
                 #pragma omp atomic
                 C[i * S + j] += svaddv_f32(svptrue_b32(), acc);
-                t_sve += omp_get_wtime() - ts1;
+                if (want_phase) t_sve += omp_get_wtime() - ts1;
             }
         }
 
@@ -333,15 +336,6 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
 
     auto gops = [&](double us) { return double(N) * S * L / us / 1e3; };
 
-    // ——— 基线：SVE + OpenMP 无分组 ———
-    omp_set_num_threads(num_threads);
-    std::vector<float> C_bl(N * S);
-    double base_us = bench([&]() {
-        memset(C_bl.data(), 0, N * S * sizeof(float));
-        lookup_sve_omp(table, A, B_T, C_bl.data(), N, S, L);
-    });
-    bool base_ok = verify(ref, C_bl.data(), N * S);
-
     // ——— BF16 参考值 ———
     std::vector<float> lut_bf16(LUT_SIZE);
     for (int i = 0; i < LUT_SIZE; ++i) {
@@ -363,8 +357,6 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
               << std::setw(8) << "级别"
               << std::setw(18) << "计算(核min~max)"
               << std::setw(12) << "同步"
-              << std::setw(14) << "标量相位"
-              << std::setw(14) << "SVE相位"
               << std::setw(14) << "预处理"
               << std::setw(12) << "L1-miss%"
               << std::setw(12) << "L2-miss%"
@@ -372,25 +364,7 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
               << std::setw(12) << "总耗时min"
               << std::setw(10) << "GOP/s"
               << std::setw(10) << "正确"
-              << "\n" << std::string(175, '-') << "\n";
-
-    // 基线行
-    std::cout << std::left
-              << std::setw(10) << "基线SVE"
-              << std::setw(8) << num_threads
-              << std::setw(14) << "256 KiB"
-              << std::setw(8) << "L2"
-              << std::setw(18) << "—"
-              << std::setw(12) << "—"
-              << std::setw(14) << "—"
-              << std::setw(14) << "—"
-              << std::setw(14) << "—"
-              << std::setw(12) << "—"
-              << std::setw(12) << "—"
-              << std::setw(18) << std::fixed << std::setprecision(1) << base_us
-              << std::setw(12) << "—"
-              << std::setw(10) << std::fixed << std::setprecision(2) << gops(base_us)
-              << std::setw(10) << (base_ok ? "OK" : "FAIL") << "\n";
+              << "\n" << std::string(145, '-') << "\n";
 
     // ——— 扫描 G ———
     constexpr int G_VALS[] = {1, 2, 4, 8, 16, 32, 64};
@@ -421,7 +395,6 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
         // ── 复用缓冲区 ──
         std::vector<float> C_g(N * S, 0);
         std::vector<float> core_t(Gi);
-        std::vector<float> scalar_t(Gi), sve_t(Gi);
         float sync_t = 0;
 
         // ── Warmup ──
@@ -437,8 +410,6 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
         double min_total = 1e18, max_total = 0;
         // 同步时间
         double sum_sync = 0;
-        // 阶段耗时（累计后取平均）
-        double sum_scalar = 0, sum_sve = 0;
         // 最佳单次（用于输出 compute min~max）
         double best_total = 1e18;
         float best_sync = 0;
@@ -455,19 +426,10 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
         for (int iter = 0; iter < ITERS; ++iter) {
             std::fill(C_g.begin(), C_g.end(), 0);
             std::fill(core_t.begin(), core_t.end(), 0);
-            std::fill(scalar_t.begin(), scalar_t.end(), 0);
-            std::fill(sve_t.begin(), sve_t.end(), 0);
             sync_t = 0;
 
             lookup_sve_grouped_omp(gd, subs, B_T, C_g.data(), N, S, L,
-                                   core_t.data(), sync_t,
-                                   scalar_t.data(), sve_t.data());
-
-            // 累加阶段耗时（取每核 max，因为最慢核决定总时间）
-            double max_scalar = *std::max_element(scalar_t.begin(), scalar_t.end());
-            double max_sve = *std::max_element(sve_t.begin(), sve_t.end());
-            sum_scalar += max_scalar;
-            sum_sve += max_sve;
+                                   core_t.data(), sync_t);
 
             double total = *std::max_element(core_t.begin(), core_t.end()) + sync_t;
 
@@ -499,8 +461,6 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
         double var_total = (sum_total2 - sum_total * mean_total) / (ITERS - 1);
         double sd_total = std::sqrt(std::max(0.0, var_total));
         double avg_sync = sum_sync / ITERS;
-        double avg_scalar = sum_scalar / ITERS;
-        double avg_sve = sum_sve / ITERS;
 
         float cmin = *std::min_element(best_core.begin(), best_core.end());
         float cmax = *std::max_element(best_core.begin(), best_core.end());
@@ -555,8 +515,6 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
                   << std::setw(8) << cl
                   << std::setw(18) << ss_comp.str()
                   << std::setw(12) << std::fixed << std::setprecision(1) << avg_sync
-                  << std::setw(14) << std::fixed << std::setprecision(1) << avg_scalar
-                  << std::setw(14) << std::fixed << std::setprecision(1) << avg_sve
                   << std::setw(14) << std::fixed << std::setprecision(1) << prep_us
                   << std::setw(12) << s_l1mr
                   << std::setw(12) << s_l2mr
