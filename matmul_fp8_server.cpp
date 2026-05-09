@@ -847,8 +847,10 @@ void exp8_two_level_lookup(const float *table, const uint8_t *A,
               << std::setw(10) << "加速比"
               << std::setw(14) << "标量相位"
               << std::setw(14) << "SVE相位"
-              << std::setw(10) << "正确"
-              << "\n" << std::string(95, '-') << "\n";
+              << std::setw(10) << "L1-miss%"
+              << std::setw(10) << "L2-miss%"
+              << std::setw(8) << "正确"
+              << "\n" << std::string(115, '-') << "\n";
 
     double baseline_single = 0;
 
@@ -862,11 +864,26 @@ void exp8_two_level_lookup(const float *table, const uint8_t *A,
         std::vector<float> scalar_t(nc), sve_t(nc);
         float sync_t = 0;
 
+        // ── Perf 计数器 ──
+        PerfCounter pc_l1_acc(ArmPmu::L1D_CACHE);
+        PerfCounter pc_l1_miss(ArmPmu::L1D_CACHE_REFILL);
+        PerfCounter pc_l2_acc(ArmPmu::L2D_CACHE);
+        PerfCounter pc_l2_miss(ArmPmu::L2D_CACHE_REFILL);
+        bool perf_ok = pc_l1_acc.ok() && pc_l1_miss.ok();
+
         // Warmup
         for (int w = 0; w < WARMUP; ++w) {
             std::fill(C_g.begin(), C_g.end(), 0);
             lookup_two_level_omp(gd, subtables, B_T, C_g.data(), N, S, L,
                                  core_t.data(), sync_t);
+        }
+
+        // 启动 perf 计数器
+        if (perf_ok) {
+            pc_l1_acc.reset(); pc_l1_acc.enable();
+            pc_l1_miss.reset(); pc_l1_miss.enable();
+            if (pc_l2_acc.ok()) { pc_l2_acc.reset(); pc_l2_acc.enable(); }
+            if (pc_l2_miss.ok()) { pc_l2_miss.reset(); pc_l2_miss.enable(); }
         }
 
         // 测量
@@ -896,11 +913,32 @@ void exp8_two_level_lookup(const float *table, const uint8_t *A,
             if (total < min_total) min_total = total;
         }
 
+        // 停止 perf 计数器
+        if (perf_ok) {
+            pc_l1_acc.disable();
+            pc_l1_miss.disable();
+            if (pc_l2_acc.ok()) pc_l2_acc.disable();
+            if (pc_l2_miss.ok()) pc_l2_miss.disable();
+        }
+
         double mean_total = sum_total / ITERS;
         double var_total = (sum_total2 - sum_total * mean_total) / (ITERS - 1);
         double sd_total = std::sqrt(std::max(0.0, var_total));
         double avg_scalar = sum_scalar / ITERS;
         double avg_sve = sum_sve / ITERS;
+
+        // Cache miss rate
+        double l1_miss_rate = -1, l2_miss_rate = -1;
+        if (perf_ok) {
+            uint64_t l1_a = pc_l1_acc.read();
+            uint64_t l1_m = pc_l1_miss.read();
+            if (l1_a > 0) l1_miss_rate = 100.0 * l1_m / l1_a;
+            if (pc_l2_acc.ok() && pc_l2_miss.ok()) {
+                uint64_t l2_a = pc_l2_acc.read();
+                uint64_t l2_m = pc_l2_miss.read();
+                if (l2_a > 0) l2_miss_rate = 100.0 * l2_m / l2_a;
+            }
+        }
 
         bool ok = verify(ref, C_g.data(), N * S, 2.0f);
 
@@ -911,6 +949,16 @@ void exp8_two_level_lookup(const float *table, const uint8_t *A,
         std::ostringstream ss_total;
         ss_total << std::fixed << std::setprecision(1) << mean_total
                  << "+" << std::setprecision(1) << sd_total;
+        std::string s_l1mr = "—";
+        if (l1_miss_rate >= 0) {
+            std::ostringstream ss; ss << std::fixed << std::setprecision(2) << l1_miss_rate << "%";
+            s_l1mr = ss.str();
+        }
+        std::string s_l2mr = "—";
+        if (l2_miss_rate >= 0) {
+            std::ostringstream ss; ss << std::fixed << std::setprecision(2) << l2_miss_rate << "%";
+            s_l2mr = ss.str();
+        }
         std::cout << std::left
                   << std::setw(8) << nc
                   << std::setw(16) << ss_total.str()
@@ -919,7 +967,9 @@ void exp8_two_level_lookup(const float *table, const uint8_t *A,
                   << std::setw(10) << std::fixed << std::setprecision(2) << speedup << "x"
                   << std::setw(14) << std::fixed << std::setprecision(1) << avg_scalar
                   << std::setw(14) << std::fixed << std::setprecision(1) << avg_sve
-                  << std::setw(10) << (ok ? "OK" : "FAIL") << "\n";
+                  << std::setw(10) << s_l1mr
+                  << std::setw(10) << s_l2mr
+                  << std::setw(8) << (ok ? "OK" : "FAIL") << "\n";
     }
     std::cout << "\n";
 }
