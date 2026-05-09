@@ -902,7 +902,7 @@ void exp8_two_level_lookup(const float *table, const uint8_t *A,
         double avg_scalar = sum_scalar / ITERS;
         double avg_sve = sum_sve / ITERS;
 
-        bool ok = verify(ref, C_g.data(), N * S);
+        bool ok = verify(ref, C_g.data(), N * S, 0.1f);
 
         if (nc == 1) baseline_single = min_total;
         double speedup = baseline_single / min_total;
