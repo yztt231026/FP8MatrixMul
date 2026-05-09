@@ -94,6 +94,51 @@ void lookup_sve_omp(const float *table, const uint8_t *A, const uint8_t *B_T,
         }
 }
 
+// ---- BF16 标量基线（顺序索引，单核） ----
+void lookup_scalar_bf16(const uint16_t *bf16_tab, const uint8_t *A,
+                         const uint8_t *B_T, float *C,
+                         int N, int S, int L) {
+    for (int i = 0; i < N; ++i)
+        for (int j = 0; j < S; ++j) {
+            float sum = 0.0f;
+            const uint8_t *rA = A + i * L, *rB = B_T + j * L;
+            for (int k = 0; k < L; ++k) {
+                int idx = (rA[k] << 8) | rB[k];
+                uint32_t bits = (uint32_t)bf16_tab[idx] << 16;
+                float v;
+                memcpy(&v, &bits, 4);
+                sum += v;
+            }
+            C[i * S + j] = sum;
+        }
+}
+
+// ---- BF16 SVE 基线（顺序索引，分块流式，单核） ----
+void lookup_sve_bf16(const uint16_t *bf16_tab, const uint8_t *A,
+                      const uint8_t *B_T, float *C,
+                      int N, int S, int L) {
+    for (int i = 0; i < N; ++i)
+        for (int j = 0; j < S; ++j) {
+            svfloat32_t acc = svdup_n_f32(0.0f);
+            const uint8_t *rA = A + i * L, *rB = B_T + j * L;
+            int k = 0;
+            svbool_t pg = svwhilelt_b32(k, L);
+            while (svptest_any(svptrue_b32(), pg)) {
+                alignas(32) float chunk[8];
+                int n = svcntw();
+                for (int tt = 0; tt < n && k + tt < L; ++tt) {
+                    int idx = (rA[k + tt] << 8) | rB[k + tt];
+                    uint32_t bits = (uint32_t)bf16_tab[idx] << 16;
+                    memcpy(chunk + tt, &bits, 4);
+                }
+                acc = svadd_f32_m(pg, acc, svld1_f32(pg, chunk));
+                k += n;
+                pg = svwhilelt_b32(k, L);
+            }
+            C[i * S + j] = svaddv_f32(svptrue_b32(), acc);
+        }
+}
+
 
 // ====================== NUMA 工具 ======================
 
@@ -326,7 +371,7 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
     std::cout << std::string(70, '=') << "\n";
     std::cout << "矩阵: " << N << "×" << L << " * " << S << "×" << L << "^T\n";
     std::cout << "L1d = " << L1D_KiB << " KiB, 子表格式: BF16 (2B)\n";
-    std::cout << "Warmup=" << 100 << ", 采样=" << 1000 << "\n\n";
+    std::cout << "Warmup=100, 采样=10000\n\n";
 
     auto gops = [&](double us) { return double(N) * S * L / us / 1e3; };
 
@@ -342,6 +387,55 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
     }
     std::vector<float> C_bf16_ref(N * S);
     lookup_scalar(lut_bf16.data(), A, B_T, C_bf16_ref.data(), N, S, L);
+
+    // ——— BF16 真表（uint16_t）及单核基线 ———
+    std::vector<uint16_t> bf16_u16(LUT_SIZE);
+    for (int i = 0; i < LUT_SIZE; ++i)
+        bf16_u16[i] = float_to_bf16(table[i]);
+
+    constexpr int WARMUP = 100;
+    constexpr int ITERS = 10000;
+
+    std::vector<float> C_bl(N * S);
+
+    // BF16 标量基线
+    for (int w = 0; w < WARMUP; ++w)
+        lookup_scalar_bf16(bf16_u16.data(), A, B_T, C_bl.data(), N, S, L);
+    double t0 = omp_get_wtime();
+    for (int iter = 0; iter < ITERS; ++iter)
+        lookup_scalar_bf16(bf16_u16.data(), A, B_T, C_bl.data(), N, S, L);
+    double bf16_scalar_us = (omp_get_wtime() - t0) * 1e6 / ITERS;
+    bool ok_sca = verify(C_bf16_ref.data(), C_bl.data(), N * S);
+
+    // BF16 SVE 基线
+    for (int w = 0; w < WARMUP; ++w)
+        lookup_sve_bf16(bf16_u16.data(), A, B_T, C_bl.data(), N, S, L);
+    t0 = omp_get_wtime();
+    for (int iter = 0; iter < ITERS; ++iter)
+        lookup_sve_bf16(bf16_u16.data(), A, B_T, C_bl.data(), N, S, L);
+    double bf16_sve_us = (omp_get_wtime() - t0) * 1e6 / ITERS;
+    bool ok_sve = verify(C_bf16_ref.data(), C_bl.data(), N * S);
+
+    double sve_speedup = bf16_scalar_us / bf16_sve_us;
+
+    std::cout << "\n— BF16 单核基线 (顺序索引, 128 KiB, L2) —\n";
+    std::cout << std::left
+              << std::setw(14) << "方式"
+              << std::setw(16) << "总耗时(μs)"
+              << std::setw(10) << "GOP/s"
+              << std::setw(10) << "正确"
+              << "\n" << std::string(50, '-') << "\n";
+    std::cout << std::left
+              << std::setw(14) << "BF16标量"
+              << std::setw(16) << std::fixed << std::setprecision(1) << bf16_scalar_us
+              << std::setw(10) << std::fixed << std::setprecision(2) << gops(bf16_scalar_us)
+              << std::setw(10) << (ok_sca ? "OK" : "FAIL") << "\n";
+    std::cout << std::left
+              << std::setw(14) << "BF16 SVE"
+              << std::setw(16) << std::fixed << std::setprecision(1) << bf16_sve_us
+              << std::setw(10) << std::fixed << std::setprecision(2) << gops(bf16_sve_us)
+              << std::setw(10) << (ok_sve ? "OK" : "FAIL") << "\n";
+    std::cout << "  SVE 加速比: " << std::fixed << std::setprecision(2) << sve_speedup << "x\n\n";
 
     // ——— 输出表头 ———
     std::cout << std::left
@@ -362,8 +456,6 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
 
     // ——— 扫描 G ———
     constexpr int G_VALS[] = {1, 2, 4, 8, 16, 32, 64};
-    constexpr int WARMUP = 100;
-    constexpr int ITERS = 10000;
 
     for (int Gi : G_VALS) {
         if (Gi > omp_get_max_threads()) continue;
