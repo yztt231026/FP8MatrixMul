@@ -103,11 +103,10 @@ void lookup_scalar_bf16(const uint16_t *bf16_tab, const uint8_t *A,
             float sum = 0.0f;
             const uint8_t *rA = A + i * L, *rB = B_T + j * L;
             for (int k = 0; k < L; ++k) {
-                int idx = (rA[k] << 8) | rB[k];
-                uint32_t bits = (uint32_t)bf16_tab[idx] << 16;
-                float v;
-                memcpy(&v, &bits, 4);
-                sum += v;
+                // BF16→float: 16 位值左移 16 位得 float32 位模式
+                union { uint32_t u; float f; } u;
+                u.u = (uint32_t)bf16_tab[(rA[k] << 8) | rB[k]] << 16;
+                sum += u.f;
             }
             C[i * S + j] = sum;
         }
@@ -124,12 +123,12 @@ void lookup_sve_bf16(const uint16_t *bf16_tab, const uint8_t *A,
             int k = 0;
             svbool_t pg = svwhilelt_b32(k, L);
             while (svptest_any(svptrue_b32(), pg)) {
-                alignas(32) float chunk[8];
                 int n = svcntw();
+                alignas(16) float chunk[8];
+                union { uint32_t u; float f; } u;
                 for (int tt = 0; tt < n && k + tt < L; ++tt) {
-                    int idx = (rA[k + tt] << 8) | rB[k + tt];
-                    uint32_t bits = (uint32_t)bf16_tab[idx] << 16;
-                    memcpy(chunk + tt, &bits, 4);
+                    u.u = (uint32_t)bf16_tab[(rA[k + tt] << 8) | rB[k + tt]] << 16;
+                    chunk[tt] = u.f;
                 }
                 acc = svadd_f32_m(pg, acc, svld1_f32(pg, chunk));
                 k += n;
