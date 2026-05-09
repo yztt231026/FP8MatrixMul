@@ -803,8 +803,8 @@ void exp8_two_level_lookup(const float *table, const uint8_t *A,
                             int N, int S, int L, int max_threads) {
     constexpr int G = 4;
     constexpr int step = 256 / G;
-    constexpr int WARMUP = 100;
-    constexpr int ITERS = 10000;
+    constexpr int WARMUP = 20;
+    constexpr int ITERS = 1000;
     constexpr int CORE_VALS[] = {1, 2, 4, 8, 16, 32, 64};
 
     std::cout << "\n" << std::string(70, '=') << "\n";
