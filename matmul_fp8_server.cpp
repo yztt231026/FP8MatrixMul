@@ -2100,7 +2100,7 @@ void exp13_primitive_cycle_bench() {
     constexpr int LOOKUPS[]   = {128, 512};
     const char *TAB_NAMES[]   = {"L1(4KiB)", "L2(256KiB)"};
 
-    int sve_ops_per_call(int n) { return n / svcntw(); }
+    auto sve_ops = [](int n) { return n / svcntw(); };
 
     for (int ti = 0; ti < 2; ++ti) {
         const float *tab = (ti == 0) ? tab_l1.data() : tab_l2.data();
@@ -2108,7 +2108,7 @@ void exp13_primitive_cycle_bench() {
 
         for (int li = 0; li < 2; ++li) {
             int n = LOOKUPS[li];
-            int sv = sve_ops_per_call(n);
+            int sv = sve_ops(n);
             std::string pfx = std::string(TAB_NAMES[ti]) + " ";
 
             // 1a. 标量顺序 (n 次操作)
