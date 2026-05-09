@@ -295,10 +295,42 @@ static void build_subtables_bf16(int G,
     }
 }
 
-/** G 核 SVE 分组建表查表（BF16 子表）：
-    标量收集 B_T + BF16 子表查表，SVE 向量化累加 */
+/** 从完整 LUT 切出 G 个 float 子表（BF16 截断，4B/entry，可直接 SVE gather） */
+static void build_subtables_bf16_float(int G,
+                                        std::vector<std::vector<float>> &subtables,
+                                        const float *lut) {
+    int step = 256 / G;
+    subtables.resize(G);
+    for (int g = 0; g < G; ++g) {
+        subtables[g].resize(step * 256);
+        for (int a = 0; a < step; ++a)
+            for (int b = 0; b < 256; ++b) {
+                uint32_t bits;
+                memcpy(&bits, &lut[(g * step + a) * 256 + b], 4);
+                bits &= 0xFFFF0000u;
+                float v;
+                memcpy(&v, &bits, 4);
+                subtables[g][a * 256 + b] = v;
+            }
+    }
+}
+
+/** 从完整 LUT 切出 G 个 float 子表（全精度 float32，不会被 BF16 截断） */
+static void build_subtables_float(int G,
+                                   std::vector<std::vector<float>> &subtables,
+                                   const float *lut) {
+    int step = 256 / G;
+    subtables.resize(G);
+    for (int g = 0; g < G; ++g) {
+        subtables[g].resize(step * 256);
+        std::copy(lut + g * step * 256, lut + (g + 1) * step * 256, subtables[g].data());
+    }
+}
+
+/** G 核 SVE 分组建表查表（float 子表，BF16/全精度均可）：
+    标量计算子表索引 + SVE gather 向量化查表 + atomic 合并 */
 void lookup_sve_grouped_omp(const GroupData &data,
-                            const std::vector<std::vector<uint16_t>> &subtables,
+                            const std::vector<std::vector<float>> &subtables,
                             const uint8_t *B_T, float *C,
                             int N, int S, int L,
                             float *core_times, float &sync_time) {
@@ -307,7 +339,7 @@ void lookup_sve_grouped_omp(const GroupData &data,
     #pragma omp parallel num_threads(G)
     {
         int g = omp_get_thread_num();
-        const uint16_t *sub = subtables[g].data();
+        const float *sub = subtables[g].data();
         int base = g * step;
 
         double t0 = omp_get_wtime();
@@ -315,27 +347,26 @@ void lookup_sve_grouped_omp(const GroupData &data,
         for (int i = 0; i < N; ++i) {
             int start = data.row_start[i * G + g];
             int count = data.row_count[i * G + g];
+            if (count == 0) continue;
             const uint8_t *a_ptr = data.A_grouped.data() + start;
             const int *k_ptr = data.k_indices.data() + start;
 
             for (int j = 0; j < S; ++j) {
                 const uint8_t *b_row = B_T + j * L;
 
-                // 标量查表 + 转换 + SVE 累加，按向量宽度分块流式处理
+                // 阶段1（标量）：计算子表索引
+                alignas(64) uint32_t idx_buf[512];
+                for (int t = 0; t < count; ++t)
+                    idx_buf[t] = (uint32_t)(a_ptr[t] - base) * 256u + b_row[k_ptr[t]];
+
+                // 阶段2（SVE）：gather + 累加 + 归约
                 svfloat32_t acc = svdup_n_f32(0.0f);
                 int t = 0;
                 svbool_t pg = svwhilelt_b32(t, count);
                 while (svptest_any(svptrue_b32(), pg)) {
-                    alignas(32) float chunk[8];
-                    int n = svcntw();
-                    for (int tt = 0; tt < n && t + tt < count; ++tt) {
-                        int b_val = b_row[k_ptr[t + tt]];
-                        int idx = (a_ptr[t + tt] - base) * 256 + b_val;
-                        uint32_t bits = (uint32_t)sub[idx] << 16;
-                        memcpy(chunk + tt, &bits, 4);
-                    }
-                    acc = svadd_f32_m(pg, acc, svld1_f32(pg, chunk));
-                    t += n;
+                    acc = svadd_f32_m(pg, acc,
+                        svld1_gather_u32index_f32(pg, sub, svld1_u32(pg, idx_buf + t)));
+                    t += svcntw();
                     pg = svwhilelt_b32(t, count);
                 }
                 #pragma omp atomic
@@ -506,11 +537,11 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
         // ── 预处理（计时） ──
         double t_prep = omp_get_wtime();
         GroupData gd = preprocess_groups(A, N, L, Gi);
-        std::vector<std::vector<uint16_t>> subs;
-        build_subtables_bf16(Gi, subs, table);
+        std::vector<std::vector<float>> subs;
+        build_subtables_bf16_float(Gi, subs, table);
         double prep_us = (omp_get_wtime() - t_prep) * 1e6;
 
-        int sub_kib = (256 / Gi) * 256 * 2 / 1024;
+        int sub_kib = (256 / Gi) * 256 * 4 / 1024;
         const char *cl = cache_level(sub_kib, L1D_KiB, L2_KiB);
 
         // ── Perf 计数器（打开失败则降级） ──
@@ -635,6 +666,150 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
 
         std::cout << std::left
                   << std::setw(10) << ("G=" + std::to_string(Gi)).c_str()
+                  << std::setw(8) << Gi
+                  << std::setw(14) << ss_sub.str()
+                  << std::setw(8) << cl
+                  << std::setw(18) << ss_comp.str()
+                  << std::setw(12) << std::fixed << std::setprecision(1) << avg_sync
+                  << std::setw(14) << std::fixed << std::setprecision(1) << prep_us
+                  << std::setw(12) << s_l1mr
+                  << std::setw(12) << s_l2mr
+                  << std::setw(18) << ss_total.str()
+                  << std::setw(12) << std::fixed << std::setprecision(1) << min_total
+                  << std::setw(10) << std::fixed << std::setprecision(2) << gops_min
+                  << std::setw(10) << (ok ? "OK" : "FAIL") << "\n";
+    }
+
+    // ——— float 全精度 SVE 分组扫描（与 BF16 分组相同测量项） ———
+    std::cout << "— float SVE 分组查表 (全精度子表) —\n";
+    std::cout << std::left
+              << std::setw(10) << "方案"
+              << std::setw(8) << "线程"
+              << std::setw(14) << "子表"
+              << std::setw(8) << "级别"
+              << std::setw(18) << "计算(核min~max)"
+              << std::setw(12) << "同步(max-min)"
+              << std::setw(14) << "预处理"
+              << std::setw(12) << "L1-miss%"
+              << std::setw(12) << "L2-miss%"
+              << std::setw(18) << "总耗时mean±sd"
+              << std::setw(12) << "总耗时min"
+              << std::setw(10) << "GOP/s"
+              << std::setw(10) << "正确"
+              << "\n" << std::string(146, '-') << "\n";
+
+    for (int Gi : G_VALS) {
+        if (Gi > num_threads) continue;
+        if (Gi > N * S) continue;
+
+        double t_prep = omp_get_wtime();
+        GroupData gd = preprocess_groups(A, N, L, Gi);
+        std::vector<std::vector<float>> subs_float;
+        build_subtables_float(Gi, subs_float, table);
+        double prep_us = (omp_get_wtime() - t_prep) * 1e6;
+
+        int sub_kib = (256 / Gi) * 256 * 4 / 1024;
+        const char *cl = cache_level(sub_kib, L1D_KiB, L2_KiB);
+
+        PerfCounter pc_l1_acc(ArmPmu::L1D_CACHE);
+        PerfCounter pc_l1_miss(ArmPmu::L1D_CACHE_REFILL);
+        PerfCounter pc_l2_acc(ArmPmu::L2D_CACHE);
+        PerfCounter pc_l2_miss(ArmPmu::L2D_CACHE_REFILL);
+        bool perf_ok = pc_l1_acc.ok() && pc_l1_miss.ok();
+
+        std::vector<float> C_g(N * S, 0);
+        std::vector<float> core_t(Gi);
+        float sync_t = 0;
+
+        // Warmup
+        for (int w = 0; w < WARMUP; ++w) {
+            std::fill(C_g.begin(), C_g.end(), 0);
+            lookup_sve_grouped_omp(gd, subs_float, B_T, C_g.data(), N, S, L,
+                                   core_t.data(), sync_t);
+        }
+
+        double sum_total = 0, sum_total2 = 0;
+        double min_total = 1e18, max_total = 0;
+        double sum_sync = 0;
+        double best_total = 1e18;
+        std::vector<float> best_core(Gi);
+
+        if (perf_ok) {
+            pc_l1_acc.reset(); pc_l1_acc.enable();
+            pc_l1_miss.reset(); pc_l1_miss.enable();
+            if (pc_l2_acc.ok()) { pc_l2_acc.reset(); pc_l2_acc.enable(); }
+            if (pc_l2_miss.ok()) { pc_l2_miss.reset(); pc_l2_miss.enable(); }
+        }
+
+        for (int iter = 0; iter < ITERS; ++iter) {
+            std::fill(C_g.begin(), C_g.end(), 0);
+            std::fill(core_t.begin(), core_t.end(), 0);
+            sync_t = 0;
+
+            lookup_sve_grouped_omp(gd, subs_float, B_T, C_g.data(), N, S, L,
+                                   core_t.data(), sync_t);
+
+            double total = *std::max_element(core_t.begin(), core_t.end());
+            sum_sync += sync_t;
+
+            sum_total += total;
+            sum_total2 += total * total;
+            if (total < min_total) min_total = total;
+            if (total > max_total) max_total = total;
+
+            if (total < best_total) {
+                best_total = total;
+                best_core = core_t;
+            }
+        }
+
+        if (perf_ok) {
+            pc_l1_acc.disable();
+            pc_l1_miss.disable();
+            if (pc_l2_acc.ok()) pc_l2_acc.disable();
+            if (pc_l2_miss.ok()) pc_l2_miss.disable();
+        }
+
+        double mean_total = sum_total / ITERS;
+        double var_total = (sum_total2 - sum_total * mean_total) / (ITERS - 1);
+        double sd_total = std::sqrt(std::max(0.0, var_total));
+        double avg_sync = sum_sync / ITERS;
+
+        float cmin = *std::min_element(best_core.begin(), best_core.end());
+        float cmax = *std::max_element(best_core.begin(), best_core.end());
+        double gops_min = gops(min_total);
+
+        double l1_miss_rate = -1, l2_miss_rate = -1;
+        if (perf_ok) {
+            uint64_t l1_a = pc_l1_acc.read(), l1_m = pc_l1_miss.read();
+            if (l1_a) l1_miss_rate = 100.0 * l1_m / l1_a;
+            if (pc_l2_acc.ok() && pc_l2_miss.ok()) {
+                uint64_t l2_a = pc_l2_acc.read(), l2_m = pc_l2_miss.read();
+                if (l2_a) l2_miss_rate = 100.0 * l2_m / l2_a;
+            }
+        }
+
+        bool ok = verify(ref, C_g.data(), N * S);
+
+        std::ostringstream ss_sub, ss_comp, ss_total;
+        ss_sub << std::fixed << std::setprecision(0) << sub_kib << " KiB";
+        ss_comp << std::fixed << std::setprecision(1) << cmin << "~" << cmax;
+        ss_total << std::fixed << std::setprecision(1) << mean_total
+                 << "±" << std::setprecision(1) << sd_total;
+
+        std::string s_l1mr = "—";
+        if (l1_miss_rate >= 0) {
+            std::ostringstream ss; ss << std::fixed << std::setprecision(2) << l1_miss_rate << "%";
+            s_l1mr = ss.str();
+        }
+        std::string s_l2mr = "—";
+        if (l2_miss_rate >= 0) {
+            std::ostringstream ss; ss << std::fixed << std::setprecision(2) << l2_miss_rate << "%";
+            s_l2mr = ss.str();
+        }
+
+        std::cout << std::left
+                  << std::setw(10) << ("F32-G=" + std::to_string(Gi)).c_str()
                   << std::setw(8) << Gi
                   << std::setw(14) << ss_sub.str()
                   << std::setw(8) << cl
