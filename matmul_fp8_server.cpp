@@ -501,9 +501,10 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
 
     // ——— 扫描 G ———
     constexpr int G_VALS[] = {1, 2, 4, 8, 16, 32, 64};
+    omp_set_num_threads(num_threads);
 
     for (int Gi : G_VALS) {
-        if (Gi > omp_get_max_threads()) continue;
+        if (Gi > num_threads) continue;
         if (Gi > N * S) continue;
 
         // ── 预处理（计时） ──
@@ -696,17 +697,18 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
         if (nc == 1) base_1core = min_t;
         double speedup = base_1core / min_t;
 
-        std::ostringstream ss;
+        std::ostringstream ss, ss_sp;
         ss << std::fixed << std::setprecision(1) << mean_t
            << "±" << std::setprecision(1) << sd_t;
+        ss_sp << std::fixed << std::setprecision(2) << speedup << "x";
 
         std::cout << std::left
                   << std::setw(8) << nc
                   << std::setw(16) << ss.str()
                   << std::setw(12) << std::fixed << std::setprecision(1) << min_t
                   << std::setw(10) << std::fixed << std::setprecision(2) << gops(min_t)
-                  << std::setw(10) << std::fixed << std::setprecision(2) << speedup << "x"
-                  << std::setw(10) << (ok ? "OK" : "FAIL") << "\n";
+                  << std::setw(10) << ss_sp.str()
+                  << std::setw(8) << (ok ? "OK" : "FAIL") << "\n";
     }
     std::cout << "\n";
 }
