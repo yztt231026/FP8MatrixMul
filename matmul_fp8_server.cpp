@@ -679,9 +679,7 @@ void lookup_two_level_omp(const GroupData &data,
                            const std::vector<std::vector<uint16_t>> &subtables,
                            const uint8_t *B_T, float *C,
                            int N, int S, int L,
-                           float *core_times, float &sync_time,
-                           float *scalar_times = nullptr,
-                           float *sve_times = nullptr) {
+                           float *core_times, float &sync_time) {
     int G = data.G, step = data.step;
 
     #pragma omp parallel
@@ -694,7 +692,6 @@ void lookup_two_level_omp(const GroupData &data,
         int i_start = tid * rows_per + std::min(tid, rem);
         int i_end = i_start + rows_per + (tid < rem ? 1 : 0);
 
-        double t_scalar = 0, t_sve = 0;
         double t0 = omp_get_wtime();
 
         for (int i = i_start; i < i_end; ++i) {
@@ -711,29 +708,24 @@ void lookup_two_level_omp(const GroupData &data,
                     const uint16_t *sub = subtables[g].data();
                     int base = g * step;
 
-                    // 阶段1：标量 BF16 查表 + 转 float
-                    double ts0 = omp_get_wtime();
-                    alignas(64) float local_vals[512];
-                    for (int t = 0; t < cnt; ++t) {
-                        int b_val = b_row[k_ptr[t]];
-                        int idx = (a_ptr[t] - base) * 256 + b_val;
-                        uint32_t bits = (uint32_t)sub[idx] << 16;
-                        memcpy(&local_vals[t], &bits, 4);
-                    }
-                    t_scalar += omp_get_wtime() - ts0;
-
-                    // 阶段2：SVE 向量化累加 + 归约
-                    double ts1 = omp_get_wtime();
+                    // 标量查表 + 转换 + SVE 累加，按向量宽度分块流式处理
                     svfloat32_t acc = svdup_n_f32(0.0f);
                     int t = 0;
                     svbool_t pg = svwhilelt_b32(t, cnt);
                     while (svptest_any(svptrue_b32(), pg)) {
-                        acc = svadd_f32_m(pg, acc, svld1_f32(pg, local_vals + t));
-                        t += svcntw();
+                        alignas(32) float chunk[8];
+                        int n = svcntw();
+                        for (int tt = 0; tt < n && t + tt < cnt; ++tt) {
+                            int b_val = b_row[k_ptr[t + tt]];
+                            int idx = (a_ptr[t + tt] - base) * 256 + b_val;
+                            uint32_t bits = (uint32_t)sub[idx] << 16;
+                            memcpy(chunk + tt, &bits, 4);
+                        }
+                        acc = svadd_f32_m(pg, acc, svld1_f32(pg, chunk));
+                        t += n;
                         pg = svwhilelt_b32(t, cnt);
                     }
                     sum += svaddv_f32(svptrue_b32(), acc);
-                    t_sve += omp_get_wtime() - ts1;
                 }
                 C[i * S + j] = sum;
             }
@@ -741,8 +733,6 @@ void lookup_two_level_omp(const GroupData &data,
 
         double t1 = omp_get_wtime();
         core_times[tid] = (t1 - t0) * 1e6;
-        if (scalar_times) scalar_times[tid] = t_scalar * 1e6;
-        if (sve_times)    sve_times[tid]    = t_sve * 1e6;
         sync_time = 0;
     }
 }
@@ -794,12 +784,10 @@ void exp8_two_level_lookup(const float *table, const uint8_t *A,
               << std::setw(12) << "总耗时min"
               << std::setw(10) << "GOP/s"
               << std::setw(10) << "加速比"
-              << std::setw(14) << "标量相位"
-              << std::setw(14) << "SVE相位"
               << std::setw(10) << "L1-miss%"
               << std::setw(10) << "L2-miss%"
               << std::setw(8) << "正确"
-              << "\n" << std::string(115, '-') << "\n";
+              << "\n" << std::string(90, '-') << "\n";
 
     double baseline_single = 0;
 
@@ -810,7 +798,6 @@ void exp8_two_level_lookup(const float *table, const uint8_t *A,
 
         std::vector<float> C_g(N * S, 0);
         std::vector<float> core_t(nc);
-        std::vector<float> scalar_t(nc), sve_t(nc);
         float sync_t = 0;
 
         // ── Perf 计数器 ──
@@ -838,23 +825,14 @@ void exp8_two_level_lookup(const float *table, const uint8_t *A,
         // 测量
         double sum_total = 0, sum_total2 = 0;
         double min_total = 1e18;
-        double sum_scalar = 0, sum_sve = 0;
 
         for (int iter = 0; iter < ITERS; ++iter) {
             std::fill(C_g.begin(), C_g.end(), 0);
             std::fill(core_t.begin(), core_t.end(), 0);
-            std::fill(scalar_t.begin(), scalar_t.end(), 0);
-            std::fill(sve_t.begin(), sve_t.end(), 0);
             sync_t = 0;
 
             lookup_two_level_omp(gd, subtables, B_T, C_g.data(), N, S, L,
-                                 core_t.data(), sync_t,
-                                 scalar_t.data(), sve_t.data());
-
-            double max_scalar = *std::max_element(scalar_t.begin(), scalar_t.end());
-            double max_sve = *std::max_element(sve_t.begin(), sve_t.end());
-            sum_scalar += max_scalar;
-            sum_sve += max_sve;
+                                 core_t.data(), sync_t);
 
             double total = *std::max_element(core_t.begin(), core_t.end()) + sync_t;
             sum_total += total;
@@ -873,8 +851,6 @@ void exp8_two_level_lookup(const float *table, const uint8_t *A,
         double mean_total = sum_total / ITERS;
         double var_total = (sum_total2 - sum_total * mean_total) / (ITERS - 1);
         double sd_total = std::sqrt(std::max(0.0, var_total));
-        double avg_scalar = sum_scalar / ITERS;
-        double avg_sve = sum_sve / ITERS;
 
         // Cache miss rate
         double l1_miss_rate = -1, l2_miss_rate = -1;
@@ -914,8 +890,6 @@ void exp8_two_level_lookup(const float *table, const uint8_t *A,
                   << std::setw(12) << std::fixed << std::setprecision(1) << min_total
                   << std::setw(10) << std::fixed << std::setprecision(2) << gops(min_total)
                   << std::setw(10) << std::fixed << std::setprecision(2) << speedup << "x"
-                  << std::setw(14) << std::fixed << std::setprecision(1) << avg_scalar
-                  << std::setw(14) << std::fixed << std::setprecision(1) << avg_sve
                   << std::setw(10) << s_l1mr
                   << std::setw(10) << s_l2mr
                   << std::setw(8) << (ok ? "OK" : "FAIL") << "\n";
