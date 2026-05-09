@@ -651,8 +651,6 @@ void exp6_l1_grouped_lut(const float *table, const uint8_t *A,
                   << std::setw(10) << std::fixed << std::setprecision(2) << gops_min
                   << std::setw(10) << (ok ? "OK" : "FAIL") << "\n";
     }
-    std::cout << "\n";
-}
 
     // ——— float SVE 核数扫描 ———
     constexpr int F32_CORES[] = {1, 2, 4, 8, 16, 32, 64};
