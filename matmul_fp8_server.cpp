@@ -853,7 +853,7 @@ void exp8_two_level_lookup(const float *table, const uint8_t *A,
     double baseline_single = 0;
 
     for (int nc : CORE_VALS) {
-        if (nc > omp_get_max_threads()) continue;
+        if (nc > max_threads) continue;
 
         omp_set_num_threads(nc);
 
