@@ -20,7 +20,19 @@
       "Bash(git status *)",
       "Bash(ping -c 1 -W 2 github.com)",
       "Bash(git remote *)",
-      "Bash(git restore *)"
+      "Bash(git restore *)",
+      "Bash(awk -v start=528 -v end=532 'NR>=start*16 && NR<=end*16')",
+      "Bash(sed -i '528s/.*/        std::vector<std::vector<float>> subs;/' matmul_fp8_server.cpp)",
+      "Bash(sed -i '529s/build_subtables_bf16\\(/build_subtables_bf16_float\\(/' matmul_fp8_server.cpp)",
+      "Bash(sed -i '532s/256 \\\\* 2 \\\\/ 1024/256 * 4 \\\\/ 1024/' matmul_fp8_server.cpp)",
+      "Bash(git diff *)",
+      "Bash(awk -F: '{if \\($1 >= 1300\\) print}')",
+      "Bash(aarch64-linux-gnu-g++ --version)",
+      "Bash(dpkg -l)",
+      "Bash(apt-cache search *)",
+      "Bash(sudo apt-get update -qq)",
+      "Bash(sudo apt-get install -y -qq g++-aarch64-linux-gnu)",
+      "Bash(clang++ --version)"
     ]
   }
 }
