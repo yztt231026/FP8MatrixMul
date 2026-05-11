@@ -32,7 +32,9 @@
       "Bash(apt-cache search *)",
       "Bash(sudo apt-get update -qq)",
       "Bash(sudo apt-get install -y -qq g++-aarch64-linux-gnu)",
-      "Bash(clang++ --version)"
+      "Bash(clang++ --version)",
+      "Bash(unset SSH_ASKPASS GIT_ASKPASS)",
+      "Bash(git -c credential.helper='!gh auth git-credential' push)"
     ]
   }
 }
