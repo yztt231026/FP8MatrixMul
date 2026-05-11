@@ -22,6 +22,80 @@ void load_bin(const std::string &path, T *data, size_t size)
 }
 
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
+
+// ─── 动态指令计数器（方案 C：代码插桩） ─────────────────────
+struct KernelStats {
+    const char *name;
+    uint64_t loop_iters;       // 热循环迭代次数
+    uint64_t elem_processed;   // 处理的元素总数（= loop_iters × 向量宽度）
+    uint64_t reduce_count;     // 归约操作次数
+    uint64_t gather_count;     // gather/查表指令数（FP8 专用）
+    uint64_t compute_count;    // 核心计算指令数（fmla/sdot/smmmla）
+};
+
+#define PRINT_KERNEL_STATS(s) do { \
+    printf("  %-40s  loop_iters=%10lu  elem=%10lu  reduce=%5lu  gather=%8lu  compute=%8lu\n", \
+        (s).name, (s).loop_iters, (s).elem_processed, (s).reduce_count, (s).gather_count, (s).compute_count); \
+} while(0)
+
+#define RESET_STATS(s) do { \
+    memset(&(s), 0, sizeof(s)); \
+} while(0)
+
+static KernelStats g_stats_fp8_scalar  = {"matmul_fp8_lookup_scalar", 0,0,0,0,0};
+static KernelStats g_stats_fp8_sve     = {"matmul_fp8_lookup_sve", 0,0,0,0,0};
+static KernelStats g_stats_fp8_sve_opt = {"matmul_fp8_lookup_sve_optimized", 0,0,0,0,0};
+static KernelStats g_stats_fp16        = {"matmul_sve_fp16", 0,0,0,0,0};
+static KernelStats g_stats_i8_sve      = {"matmul_int8_sve", 0,0,0,0,0};
+static KernelStats g_stats_i8mm        = {"matmul_int8_i8mm_complete", 0,0,0,0,0};
+
+void print_all_stats() {
+    const uint64_t total_ij = (uint64_t)g_N * g_S;  // 128 × 328 = 41,984
+    const uint64_t total_calls = 10000;
+
+    printf("\n" "══════════════════════════════════════════════════════════════════════════════════════\n");
+    printf("动态指令计数报告（代码插桩）  N=%d S=%d L=%d  total_ij=%lu  loopCnt=%lu\n",
+           g_N, g_S, g_L, total_ij, total_calls);
+    printf("══════════════════════════════════════════════════════════════════════════════════════\n");
+    printf("  %-40s %10s %10s %8s %8s %8s %8s\n",
+           "Kernel", "loop_iters", "elem", "reduce", "gather", "compute", "iter/ij");
+    printf("  ─────────────────────────────────────────────────────────────────────────────────────────\n");
+
+    KernelStats *all[] = {&g_stats_fp8_scalar, &g_stats_fp8_sve, &g_stats_fp8_sve_opt,
+                          &g_stats_fp16, &g_stats_i8_sve, &g_stats_i8mm};
+    for (auto s : all) {
+        uint64_t iters_per_ij = s->loop_iters / (total_calls * total_ij);
+        printf("  %-40s %10lu %10lu %8lu %8lu %8lu %8lu\n",
+               s->name, s->loop_iters, s->elem_processed,
+               s->reduce_count, s->gather_count, s->compute_count, iters_per_ij);
+    }
+    printf("══════════════════════════════════════════════════════════════════════════════════════\n");
+
+    printf("\n每call平均（÷%lu）：\n", total_calls);
+    printf("  %-40s %10s %10s %8s %8s %8s\n", "Kernel", "loop_iters", "elem", "reduce", "gather", "compute");
+    printf("  ───────────────────────────────────────────────────────────────────────\n");
+    for (auto s : all) {
+        printf("  %-40s %10lu %10lu %8lu %8lu %8lu\n",
+               s->name,
+               s->loop_iters / total_calls, s->elem_processed / total_calls,
+               s->reduce_count / total_calls, s->gather_count / total_calls,
+               s->compute_count / total_calls);
+    }
+
+    printf("\n每(ij)平均（÷%lu）：\n", total_calls * total_ij);
+    printf("  %-40s %10s %10s %8s %8s %8s\n", "Kernel", "loop_iters", "elem", "reduce", "gather", "compute");
+    printf("  ───────────────────────────────────────────────────────────────────────\n");
+    uint64_t per_ij = total_calls * total_ij;
+    for (auto s : all) {
+        printf("  %-40s %10lu %10lu %8lu %8lu %8lu\n",
+               s->name,
+               s->loop_iters / per_ij, s->elem_processed / per_ij,
+               s->reduce_count / per_ij, s->gather_count / per_ij,
+               s->compute_count / per_ij);
+    }
+}
 
 /**
  * 标量版 FP8 查表模拟矩阵乘法
@@ -38,6 +112,7 @@ void matmul_fp8_lookup_scalar(const float *table, const uint8_t *A, const uint8_
             const uint8_t *rowA = &A[i * L];
             const uint8_t *rowB = &B_T[j * L];
             for (int k = 0; k < L; ++k) {
+                g_stats_fp8_scalar.loop_iters++;
                 // 1. 获取两个矩阵中的 FP8 索引值
                 uint8_t idxA = rowA[k];
                 uint8_t idxB = rowB[k];
@@ -45,11 +120,11 @@ void matmul_fp8_lookup_scalar(const float *table, const uint8_t *A, const uint8_
                 // 2. 计算在查找表中的线性偏移地址 (row * 256 + col)
                 // 使用位移运算 idxA << 8 替代 idxA * 256
                 int offset = (static_cast<int>(idxA) << 8) | idxB;
-                // int offset = 0;
                 //  3. 查表并累加
-                //  注意：__fp16 会自动隐式转换为 float 进行加法以保证精度
                 sum += static_cast<float>(table[offset]);
             }
+            g_stats_fp8_scalar.elem_processed += L;
+            g_stats_fp8_scalar.reduce_count++;
 
             // 4. 将结果存入 C 矩阵
             C[i * S + j] = sum;
@@ -79,6 +154,7 @@ void matmul_fp8_lookup_sve(const float *table, const uint8_t *A, const uint8_t *
             svbool_t pg = svwhilelt_b32(k, L);
 
             while (svptest_any(svptrue_b32(), pg)) {
+                g_stats_fp8_sve.loop_iters++;
                 // 1. 加载 8 位索引并扩展到 32 位 (u8 -> u32)
                 svuint32_t idxA = svld1ub_u32(pg, &rowA[k]);
                 svuint32_t idxB = svld1ub_u32(pg, &rowB[k]);
@@ -87,9 +163,8 @@ void matmul_fp8_lookup_sve(const float *table, const uint8_t *A, const uint8_t *
                 svuint32_t indices = svorr_u32_z(pg, svlsl_n_u32_z(pg, idxA, 8), idxB);
 
                 // 3. Gather 加载 float 数据
-                // 使用 index 版本：它会自动将索引乘以 sizeof(float)
-                // 如果编译器还报找不到，请改为 svld1_gather_index(pg, table, indices)
                 svfloat32_t vals = svld1_gather_u32index_f32(pg, table, indices);
+                g_stats_fp8_sve.gather_count++;
 
                 // 4. 向量累加
                 acc_v = svadd_f32_z(pg, acc_v, vals);
@@ -97,6 +172,8 @@ void matmul_fp8_lookup_sve(const float *table, const uint8_t *A, const uint8_t *
                 k += svcntw();
                 pg = svwhilelt_b32(k, L);
             }
+            g_stats_fp8_sve.elem_processed += L;
+            g_stats_fp8_sve.reduce_count++;
 
             // 5. 归约求和并存入结果矩阵
             C[i * S + j] = svaddv_f32(svptrue_b32(), acc_v);
@@ -130,6 +207,7 @@ void matmul_fp8_lookup_sve_optimized(
             svbool_t pg = svwhilelt_b32(k, L);
 
             while (svptest_any(svptrue_b32(), pg)) {
+                g_stats_fp8_sve_opt.loop_iters++;
                 // 直接加载已经左移好的 A (u32)
                 svuint32_t va_sh = svld1_u32(pg, &rowA_sh[k]);
 
@@ -141,14 +219,14 @@ void matmul_fp8_lookup_sve_optimized(
 
                 // Gather 加载并累加
                 svfloat32_t vals = svld1_gather_u32index_f32(pg, table, indices);
+                g_stats_fp8_sve_opt.gather_count++;
                 acc_v = svadd_f32_z(pg, acc_v, vals);
 
                 k += svcntw();
                 pg = svwhilelt_b32(k, L);
             }
-
-            // 归约求和
-            C[i * S + j] = svaddv_f32(svptrue_b32(), acc_v);
+            g_stats_fp8_sve_opt.elem_processed += L;
+            g_stats_fp8_sve_opt.reduce_count++;
         }
     }
 
@@ -216,19 +294,19 @@ void matmul_sve_fp16(const __fp16 *A, const __fp16 *B_T, float *C, int N, int S,
             svbool_t pg = svwhilelt_b16(k, L);
 
             while (svptest_any(svptrue_b16(), pg)) {
+                g_stats_fp16.loop_iters++;
                 svfloat16_t va = svld1_f16(pg, &rowA[k]);
                 svfloat16_t vb = svld1_f16(pg, &rowB[k]);
 
                 // 乘加运算
                 acc_v = svmla_f16_z(pg, acc_v, va, vb);
+                g_stats_fp16.compute_count++;
 
                 k += svcnth();
                 pg = svwhilelt_b16(k, L);
             }
-
-            // 归约求和并将结果存入 C[i][j]
-            // 注意：这里将 fp16 结果转为 float 存储以提高最终结果精度
-            C[i * S + j] = (float)svaddv_f16(svptrue_b16(), acc_v);
+            g_stats_fp16.elem_processed += L;
+            g_stats_fp16.reduce_count++;
         }
     }
 }
@@ -299,21 +377,21 @@ void matmul_int8_sve(const int8_t *A, const int8_t *B_T, int32_t *C, int N, int 
             svbool_t pg = svwhilelt_b8(k, L);
 
             while (svptest_any(svptrue_b8(), pg)) {
+                g_stats_i8_sve.loop_iters++;
                 // 1. 加载 int8 向量
                 svint8_t va = svld1_s8(pg, &rowA[k]);
                 svint8_t vb = svld1_s8(pg, &rowB[k]);
 
                 // 2. 核心：点积指令
-                // 该指令对 va 和 vb 中每 4 个相邻元素进行点积，累加到 acc_v 对应的 32 位通道
                 acc_v = svdot_s32(acc_v, va, vb);
+                g_stats_i8_sve.compute_count++;
 
                 // 3. 步进：svcntb() 返回当前字节通道数
                 k += svcntb();
                 pg = svwhilelt_b8(k, L);
             }
-
-            // 4. 归约：将所有 32 位通道的值相加得到最终标量
-            C[i * S + j] = svaddv_s32(svptrue_b32(), acc_v);
+            g_stats_i8_sve.elem_processed += L;
+            g_stats_i8_sve.reduce_count++;
         }
     }
 }
@@ -337,6 +415,7 @@ void matmul_int8_i8mm_complete(const int8_t *A, const int8_t *B_T, int32_t *C, i
             svint32_t acc10 = svdup_n_s32(0), acc11 = svdup_n_s32(0);
 
             for (int k = 0; k < L; k += svcntb()) {
+                g_stats_i8mm.loop_iters++;
                 svbool_t pg = svwhilelt_b8(k, L);
                 svint8_t va0 = svld1_s8(pg, &rA0[k]), va1 = svld1_s8(pg, &rA1[k]);
                 svint8_t vb0 = svld1_s8(pg, &rB0[k]), vb1 = svld1_s8(pg, &rB1[k]);
@@ -345,7 +424,10 @@ void matmul_int8_i8mm_complete(const int8_t *A, const int8_t *B_T, int32_t *C, i
                 acc01 = svmmla_s32(acc01, va0, vb1);
                 acc10 = svmmla_s32(acc10, va1, vb0);
                 acc11 = svmmla_s32(acc11, va1, vb1);
+                g_stats_i8mm.compute_count += 4;
             }
+            g_stats_i8mm.elem_processed += L * 4;  // 2x2 output
+            g_stats_i8mm.reduce_count += 4;
             C[(i + 0) * S + (j + 0)] = svaddv_s32(svptrue_b32(), acc00);
             C[(i + 0) * S + (j + 1)] = svaddv_s32(svptrue_b32(), acc01);
             C[(i + 1) * S + (j + 0)] = svaddv_s32(svptrue_b32(), acc10);
@@ -360,7 +442,11 @@ void matmul_int8_i8mm_complete(const int8_t *A, const int8_t *B_T, int32_t *C, i
                 svint8_t vb = svld1_s8(pg, &rB[k]);
                 acc0 = svmmla_s32(acc0, svld1_s8(pg, &rA0[k]), vb);
                 acc1 = svmmla_s32(acc1, svld1_s8(pg, &rA1[k]), vb);
+                g_stats_i8mm.compute_count += 2;
+                g_stats_i8mm.loop_iters++;
             }
+            g_stats_i8mm.elem_processed += L * 2;
+            g_stats_i8mm.reduce_count += 2;
             C[(i + 0) * S + j] = svaddv_s32(svptrue_b32(), acc0);
             C[(i + 1) * S + j] = svaddv_s32(svptrue_b32(), acc1);
         }
@@ -374,7 +460,11 @@ void matmul_int8_i8mm_complete(const int8_t *A, const int8_t *B_T, int32_t *C, i
             for (int k = 0; k < L; k += svcntb()) {
                 svbool_t pg = svwhilelt_b8(k, L);
                 acc = svmmla_s32(acc, svld1_s8(pg, &rA[k]), svld1_s8(pg, &rB[k]));
+                g_stats_i8mm.compute_count++;
+                g_stats_i8mm.loop_iters++;
             }
+            g_stats_i8mm.elem_processed += L;
+            g_stats_i8mm.reduce_count++;
             C[i * S + j] = svaddv_s32(svptrue_b32(), acc);
         }
     }
@@ -486,5 +576,6 @@ int main()
         std::cout << "i8 sve mat mul dura = " << dura2.count() / loopCnt / 1000.0 << " us" << std::endl;
         std::cout << "i8 mm mat mul dura = " << dura3.count() / loopCnt / 1000.0 << " us" << std::endl;
     }
+    print_all_stats();
     return 0;
 }
