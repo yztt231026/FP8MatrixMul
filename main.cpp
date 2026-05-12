@@ -348,6 +348,7 @@ void matmul_sve_fp16(const __fp16 *A, const __fp16 *B_T, float *C, int N, int S,
             }
             g_stats_fp16.elem_processed += L;
             g_stats_fp16.reduce_count++;
+            C[i * S + j] = (float)svaddv_f16(svptrue_b16(), acc_v);
         }
     }
 }
@@ -433,6 +434,7 @@ void matmul_int8_sve(const int8_t *A, const int8_t *B_T, int32_t *C, int N, int 
             }
             g_stats_i8_sve.elem_processed += L;
             g_stats_i8_sve.reduce_count++;
+            C[i * S + j] = svaddv_s32(svptrue_b32(), acc_v);
         }
     }
 }
