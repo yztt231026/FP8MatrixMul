@@ -512,8 +512,28 @@ int main()
     load_bin("./input/matrix_b_i8.bin", b_i8.data(), g_S * g_L);
 
     int loopCnt = 10000;
+    int warmup = 100;
+    // 预热（所有kernel都跑一遍warmup次）
+    std::cout << "Warming up (" << warmup << " iterations per kernel)..." << std::endl;
+    for (int i = 0; i < warmup; ++i) {
+        matmul_fp8_lookup_scalar(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L);
+        matmul_fp8_lookup_sve(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L);
+        matmul_fp8_lookup_sve_optimized(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L);
+        matmul_sve_fp16(a_fp16.data(), b_fp16.data(), res.data(), g_N, g_S, g_L);
+        matmul_scalar(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+        matmul_int8_sve(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+        matmul_int8_i8mm_complete(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+    }
+    // 复位计数器（预热不计入统计）
+    RESET_STATS(g_stats_fp8_scalar);
+    RESET_STATS(g_stats_fp8_sve);
+    RESET_STATS(g_stats_fp8_sve_opt);
+    RESET_STATS(g_stats_fp16);
+    RESET_STATS(g_stats_i8_sve);
+    RESET_STATS(g_stats_i8mm);
+
     {  // 查表计算
-        std::cout << "Computing FP8 LUT MatMul..." << std::endl;
+        std::cout << "\nComputing FP8 LUT MatMul..." << std::endl;
         std::vector<float> times(loopCnt);
         for (int i = 0; i < loopCnt; ++i) {
             TimoPoint tpBegin = std::chrono::high_resolution_clock::now();
