@@ -229,6 +229,7 @@ void matmul_fp8_lookup_sve_optimized(
             }
             g_stats_fp8_sve_opt.elem_processed += L;
             g_stats_fp8_sve_opt.reduce_count++;
+            C[i * S + j] = svaddv_f32(svptrue_b32(), acc_v);
         }
     }
 
