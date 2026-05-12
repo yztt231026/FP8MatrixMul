@@ -48,6 +48,7 @@ struct KernelStats {
 static KernelStats g_stats_fp8_scalar  = {"matmul_fp8_lookup_scalar", 0,0,0,0,0};
 static KernelStats g_stats_fp8_sve     = {"matmul_fp8_lookup_sve", 0,0,0,0,0};
 static KernelStats g_stats_fp8_sve_opt = {"matmul_fp8_lookup_sve_optimized", 0,0,0,0,0};
+static KernelStats g_stats_fp8_preshift = {"matmul_fp8_lookup_sve_preshift", 0,0,0,0,0};
 static KernelStats g_stats_fp16        = {"matmul_sve_fp16", 0,0,0,0,0};
 static KernelStats g_stats_i8_sve      = {"matmul_int8_sve", 0,0,0,0,0};
 static KernelStats g_stats_i8mm        = {"matmul_int8_i8mm_complete", 0,0,0,0,0};
@@ -64,7 +65,7 @@ void print_all_stats() {
            "Kernel", "loop_iters", "elem", "reduce", "gather", "compute", "iter/ij");
     printf("  ─────────────────────────────────────────────────────────────────────────────────────────\n");
 
-    KernelStats *all[] = {&g_stats_fp8_scalar, &g_stats_fp8_sve, &g_stats_fp8_sve_opt,
+    KernelStats *all[] = {&g_stats_fp8_scalar, &g_stats_fp8_sve, &g_stats_fp8_sve_opt, &g_stats_fp8_preshift,
                           &g_stats_fp16, &g_stats_i8_sve, &g_stats_i8mm};
     for (auto s : all) {
         uint64_t iters_per_ij = s->loop_iters / (total_calls * total_ij);
@@ -233,6 +234,44 @@ void matmul_fp8_lookup_sve_optimized(
 
     // --- 3. 释放临时内存 ---
     free(A_shifted);
+}
+
+/**
+ * SVE 查表法（A 已预移位，无 alloc/shift 开销）
+ * @param table  256x256 的 float 查找表
+ * @param A_shifted  预左移 8 位的 A 矩阵 (uint32_t, N×L)
+ * @param B_T    S*L 的 FP8 (uint8) 矩阵 (已转置)
+ * @param C      N*S 的 float 结果矩阵
+ *
+ * A_shifted 由调用方一次性预处理，kernel 内部不再 alloc/free。
+ */
+void matmul_fp8_lookup_sve_preshift(
+    const float *table, const uint32_t *A_shifted, const uint8_t *B_T,
+    float *C, int N, int S, int L)
+{
+    for (int i = 0; i < N; ++i) {
+        const uint32_t *rowA_sh = A_shifted + i * L;
+        for (int j = 0; j < S; ++j) {
+            const uint8_t *rowB = B_T + j * L;
+            svfloat32_t acc_v = svdup_n_f32(0.0f);
+            int k = 0;
+            svbool_t pg = svwhilelt_b32(k, L);
+            while (svptest_any(svptrue_b32(), pg)) {
+                g_stats_fp8_preshift.loop_iters++;
+                svuint32_t va_sh = svld1_u32(pg, &rowA_sh[k]);
+                svuint32_t vb = svld1ub_u32(pg, &rowB[k]);
+                svuint32_t indices = svorr_u32_z(pg, va_sh, vb);
+                svfloat32_t vals = svld1_gather_u32index_f32(pg, table, indices);
+                g_stats_fp8_preshift.gather_count++;
+                acc_v = svadd_f32_z(pg, acc_v, vals);
+                k += svcntw();
+                pg = svwhilelt_b32(k, L);
+            }
+            g_stats_fp8_preshift.elem_processed += L;
+            g_stats_fp8_preshift.reduce_count++;
+            C[i * S + j] = svaddv_f32(svptrue_b32(), acc_v);
+        }
+    }
 }
 
 /**
@@ -503,6 +542,9 @@ int main()
     std::vector<int8_t> a_i8(g_N * g_L), b_i8(g_S * g_L);
     std::vector<int32_t> res_i32(g_N * g_S);
 
+    // 预分配 A_shifted 缓冲区（供 preshift 实验使用）
+    uint32_t *A_shifted = (uint32_t *)aligned_alloc(64, (size_t)g_N * g_L * sizeof(uint32_t));
+
     // 读取 5 个文件
     load_bin("./input/matrix_a_8.bin", a_fp8.data(), g_N * g_L);
     load_bin("./input/matrix_b_8.bin", b_fp8.data(), g_S * g_L);
@@ -512,6 +554,11 @@ int main()
     load_bin("./input/matrix_a_i8.bin", a_i8.data(), g_N * g_L);
     load_bin("./input/matrix_b_i8.bin", b_i8.data(), g_S * g_L);
 
+    // 初始化 A_shifted（文件数据已加载）
+    for (int i = 0; i < g_N * g_L; ++i) {
+        A_shifted[i] = (uint32_t)a_fp8[i] << 8;
+    }
+
     int loopCnt = 10000;
     int warmup = 100;
     // 预热（所有kernel都跑一遍warmup次）
@@ -520,6 +567,7 @@ int main()
         matmul_fp8_lookup_scalar(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L);
         matmul_fp8_lookup_sve(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L);
         matmul_fp8_lookup_sve_optimized(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L);
+        matmul_fp8_lookup_sve_preshift(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L);
         matmul_sve_fp16(a_fp16.data(), b_fp16.data(), res.data(), g_N, g_S, g_L);
         matmul_scalar(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
         matmul_int8_sve(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
@@ -529,6 +577,7 @@ int main()
     RESET_STATS(g_stats_fp8_scalar);
     RESET_STATS(g_stats_fp8_sve);
     RESET_STATS(g_stats_fp8_sve_opt);
+    RESET_STATS(g_stats_fp8_preshift);
     RESET_STATS(g_stats_fp16);
     RESET_STATS(g_stats_i8_sve);
     RESET_STATS(g_stats_i8mm);
@@ -557,6 +606,24 @@ int main()
             times[i] = (tpEnd - tpBegin).count() / 1000;
         }
         std::cout << "FP8 lookup sve opt dura = " << Average(times) << " us" << std::endl;
+
+        // 预移位 A（一次性预处理，单独计时）
+        TimoPoint tpPreshiftBegin = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < g_N * g_L; ++i) {
+            A_shifted[i] = (uint32_t)a_fp8[i] << 8;
+        }
+        TimoPoint tpPreshiftEnd = std::chrono::high_resolution_clock::now();
+        double preshift_us = (tpPreshiftEnd - tpPreshiftBegin).count() / 1000.0;
+        std::cout << "A_shifted preprocess dura = " << preshift_us << " us (one-time)" << std::endl;
+
+        // preshift 版：A 已预移位，循环内无 alloc/shift 开销
+        for (int i = 0; i < loopCnt; ++i) {
+            TimoPoint tpBegin = std::chrono::high_resolution_clock::now();
+            matmul_fp8_lookup_sve_preshift(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L);
+            TimoPoint tpEnd = std::chrono::high_resolution_clock::now();
+            times[i] = (tpEnd - tpBegin).count() / 1000;
+        }
+        std::cout << "FP8 lookup sve preshift dura = " << Average(times) << " us" << std::endl;
         // std::chrono::nanoseconds dura1 = tpAfterFP8LookupScalar - tpBegin;
         // std::chrono::nanoseconds dura2 = tpAfterFP8LookupSve - tpAfterFP8LookupScalar;
         // std::chrono::nanoseconds dura3 = tpAfterFP8LookupSveOpt - tpAfterFP8LookupSve;
@@ -598,5 +665,6 @@ int main()
         std::cout << "i8 mm mat mul dura = " << dura3.count() / loopCnt / 1000.0 << " us" << std::endl;
     }
     print_all_stats();
+    free(A_shifted);
     return 0;
 }
