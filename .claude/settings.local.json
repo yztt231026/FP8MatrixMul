@@ -34,7 +34,15 @@
       "Bash(sudo apt-get install -y -qq g++-aarch64-linux-gnu)",
       "Bash(clang++ --version)",
       "Bash(unset SSH_ASKPASS GIT_ASKPASS)",
-      "Bash(git -c credential.helper='!gh auth git-credential' push)"
+      "Bash(git -c credential.helper='!gh auth git-credential' push)",
+      "Bash(./gen_data)",
+      "Bash(git -C /home/cuihaitao/cache_test add main.cpp gen_data.cpp)",
+      "Bash(git -C /home/cuihaitao/cache_test commit -m 'main.cpp: add warm-up loop before timing measurements')",
+      "Bash(git -C /home/cuihaitao/cache_test remote -v)",
+      "Bash(git -C /home/cuihaitao/cache_test push origin exp8)",
+      "Bash(git -C /home/cuihaitao/cache_test add main.cpp gen_data.cpp 实验结果汇总.md)",
+      "Bash(git -C /home/cuihaitao/cache_test commit -m ' *)",
+      "Bash(git *)"
     ]
   }
 }
