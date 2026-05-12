@@ -41,7 +41,8 @@ struct KernelStats {
 } while(0)
 
 #define RESET_STATS(s) do { \
-    memset(&(s), 0, sizeof(s)); \
+    (s).loop_iters = 0; (s).elem_processed = 0; \
+    (s).reduce_count = 0; (s).gather_count = 0; (s).compute_count = 0; \
 } while(0)
 
 static KernelStats g_stats_fp8_scalar  = {"matmul_fp8_lookup_scalar", 0,0,0,0,0};
