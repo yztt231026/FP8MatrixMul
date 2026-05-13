@@ -127,6 +127,7 @@ static KernelStats g_stats_fp8_preshift = {"matmul_fp8_lookup_sve_preshift", 0,0
 static KernelStats g_stats_preshift_opt = {"matmul_fp8_lookup_sve_preshift_opt", 0,0,0,0,0};
 static KernelStats g_stats_fp16        = {"matmul_sve_fp16", 0,0,0,0,0};
 static KernelStats g_stats_i8_sve      = {"matmul_int8_sve", 0,0,0,0,0};
+static KernelStats g_stats_i8_scalar  = {"matmul_int8_scalar", 0,0,0,0,0};
 static KernelStats g_stats_i8mm        = {"matmul_int8_i8mm_complete", 0,0,0,0,0};
 
 void print_all_stats() {
@@ -142,7 +143,7 @@ void print_all_stats() {
     printf("  ─────────────────────────────────────────────────────────────────────────────────────────\n");
 
     KernelStats *all[] = {&g_stats_fp8_scalar, &g_stats_fp8_sve, &g_stats_fp8_sve_opt, &g_stats_fp8_preshift,
-                          &g_stats_preshift_opt, &g_stats_fp16, &g_stats_i8_sve, &g_stats_i8mm};
+                          &g_stats_preshift_opt, &g_stats_fp16, &g_stats_i8_scalar, &g_stats_i8_sve, &g_stats_i8mm};
     for (auto s : all) {
         uint64_t iters_per_ij = s->loop_iters / (total_calls * total_ij);
         printf("  %-40s %10lu %10lu %8lu %8lu %8lu %8lu\n",
@@ -521,6 +522,24 @@ void matmul_scalar(const T *A, const T *B_T, U *C, int N, int S, int L)
  * 标量版 INT8 矩阵乘法 (B 已转置)
  * C = A * B_T
  */
+void matmul_int8_scalar(const int8_t *A, const int8_t *B_T, int32_t *C, int N, int S, int L)
+{
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j < S; ++j) {
+            int32_t sum = 0;
+            const int8_t *rowA = A + i * L;
+            const int8_t *rowB = B_T + j * L;
+
+            for (int k = 0; k < L; ++k) {
+                g_stats_i8_scalar.loop_iters++;
+                sum += (int32_t)rowA[k] * (int32_t)rowB[k];
+            }
+            g_stats_i8_scalar.elem_processed += L;
+            g_stats_i8_scalar.reduce_count++;
+            C[i * S + j] = sum;
+        }
+    }
+}
 // void matmul_int8_scalar(const int8_t *A, const int8_t *B_T, int32_t *C, int N, int S, int L)
 // {
 //     for (int i = 0; i < N; ++i) {
@@ -712,7 +731,7 @@ int main()
         matmul_fp8_lookup_sve_preshift(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L);
         matmul_fp8_lookup_sve_preshift_opt(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L);
         matmul_sve_fp16(a_fp16.data(), b_fp16.data(), res.data(), g_N, g_S, g_L);
-        matmul_scalar(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+        matmul_int8_scalar(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
         matmul_int8_sve(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
         matmul_int8_i8mm_complete(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
     }
@@ -723,6 +742,7 @@ int main()
     RESET_STATS(g_stats_fp8_preshift);
     RESET_STATS(g_stats_preshift_opt);
     RESET_STATS(g_stats_fp16);
+    RESET_STATS(g_stats_i8_scalar);
     RESET_STATS(g_stats_i8_sve);
     RESET_STATS(g_stats_i8mm);
 
@@ -803,7 +823,7 @@ int main()
         std::cout << "Computing i8 MatMul..." << std::endl;
         TimoPoint tpBegin = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < loopCnt; ++i) {
-            matmul_scalar(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+            matmul_int8_scalar(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
         }
         TimoPoint tpAfterI8ScalarMatMul = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < loopCnt; ++i) {
@@ -854,6 +874,7 @@ int main()
         report("FP8 SVE preshift", [&](){ matmul_fp8_lookup_sve_preshift(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L); });
         report("FP8 SVE preshift_opt", [&](){ matmul_fp8_lookup_sve_preshift_opt(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L); });
         report("FP16 SVE fmla",    [&](){ matmul_sve_fp16(a_fp16.data(), b_fp16.data(), res.data(), g_N, g_S, g_L); });
+        report("INT8 \xe6\xa0\x87\xe9\x87\x8f", [&](){ matmul_int8_scalar(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
         report("INT8 SVE sdot",    [&](){ matmul_int8_sve(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
         report("INT8 I8MM smmla",  [&](){ matmul_int8_i8mm_complete(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
         std::cout << "\n";
