@@ -24,6 +24,7 @@ void load_bin(const std::string &path, T *data, size_t size)
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <functional>
 #include <iomanip>
 #include <sys/ioctl.h>
@@ -144,35 +145,53 @@ void print_all_stats() {
 
     KernelStats *all[] = {&g_stats_fp8_scalar, &g_stats_fp8_sve, &g_stats_fp8_sve_opt, &g_stats_fp8_preshift,
                           &g_stats_preshift_opt, &g_stats_fp16, &g_stats_i8_scalar, &g_stats_i8_sve, &g_stats_i8mm};
+    int n_printed = 0;
     for (auto s : all) {
+        if (s->loop_iters == 0) continue;
+        if (n_printed == 0) {
+            printf("  %-40s %10s %10s %8s %8s %8s %8s\n",
+                   "Kernel", "loop_iters", "elem", "reduce", "gather", "compute", "iter/ij");
+            printf("  ─────────────────────────────────────────────────────────────────────────────────────────\n");
+        }
         uint64_t iters_per_ij = s->loop_iters / (total_calls * total_ij);
         printf("  %-40s %10lu %10lu %8lu %8lu %8lu %8lu\n",
                s->name, s->loop_iters, s->elem_processed,
                s->reduce_count, s->gather_count, s->compute_count, iters_per_ij);
+        n_printed++;
     }
-    printf("══════════════════════════════════════════════════════════════════════════════════════\n");
+    if (n_printed) printf("══════════════════════════════════════════════════════════════════════════════════════\n");
 
-    printf("\n每call平均（÷%lu）：\n", total_calls);
-    printf("  %-40s %10s %10s %8s %8s %8s\n", "Kernel", "loop_iters", "elem", "reduce", "gather", "compute");
-    printf("  ───────────────────────────────────────────────────────────────────────\n");
+    n_printed = 0;
     for (auto s : all) {
+        if (s->loop_iters == 0) continue;
+        if (n_printed == 0) {
+            printf("\n每call平均（÷%lu）：\n", total_calls);
+            printf("  %-40s %10s %10s %8s %8s %8s\n", "Kernel", "loop_iters", "elem", "reduce", "gather", "compute");
+            printf("  ───────────────────────────────────────────────────────────────────────\n");
+        }
         printf("  %-40s %10lu %10lu %8lu %8lu %8lu\n",
                s->name,
                s->loop_iters / total_calls, s->elem_processed / total_calls,
                s->reduce_count / total_calls, s->gather_count / total_calls,
                s->compute_count / total_calls);
+        n_printed++;
     }
 
-    printf("\n每(ij)平均（÷%lu）：\n", total_calls * total_ij);
-    printf("  %-40s %10s %10s %8s %8s %8s\n", "Kernel", "loop_iters", "elem", "reduce", "gather", "compute");
-    printf("  ───────────────────────────────────────────────────────────────────────\n");
     uint64_t per_ij = total_calls * total_ij;
+    n_printed = 0;
     for (auto s : all) {
+        if (s->loop_iters == 0) continue;
+        if (n_printed == 0) {
+            printf("\n每(ij)平均（÷%lu）：\n", total_calls * total_ij);
+            printf("  %-40s %10s %10s %8s %8s %8s\n", "Kernel", "loop_iters", "elem", "reduce", "gather", "compute");
+            printf("  ───────────────────────────────────────────────────────────────────────\n");
+        }
         printf("  %-40s %10lu %10lu %8lu %8lu %8lu\n",
                s->name,
                s->loop_iters / per_ij, s->elem_processed / per_ij,
                s->reduce_count / per_ij, s->gather_count / per_ij,
                s->compute_count / per_ij);
+        n_printed++;
     }
 }
 
@@ -692,7 +711,7 @@ T Average(std::vector<T> &datas)
     return sum / datas.size();
 }
 
-int main()
+int main(int argc, char **argv)
 {
     // 分配内存
     std::vector<uint8_t> a_fp8(g_N * g_L), b_fp8(g_S * g_L);
@@ -720,136 +739,184 @@ int main()
         A_shifted[i] = (uint32_t)a_fp8[i] << 8;
     }
 
+    // ─── 命令行参数解析 ───
+    bool run_all = true;
+    bool run_fp8_scalar = false, run_fp8_sve = false, run_fp8_opt = false;
+    bool run_fp8_preshift = false, run_fp8_preshift_opt = false;
+    bool run_fp16 = false, run_i8_scalar = false, run_i8_sve = false, run_i8mm = false;
+
+    if (argc > 1) {
+        run_all = false;
+        for (int a = 1; a < argc; ++a) {
+            std::string arg = argv[a];
+            if (arg == "all")              run_all = true;
+            else if (arg == "fp8_scalar")  run_fp8_scalar = true;
+            else if (arg == "fp8_sve")     run_fp8_sve = true;
+            else if (arg == "fp8_opt")     run_fp8_opt = true;
+            else if (arg == "fp8_preshift") run_fp8_preshift = true;
+            else if (arg == "fp8_preshift_opt" || arg == "preshift_opt") run_fp8_preshift_opt = true;
+            else if (arg == "fp16")         run_fp16 = true;
+            else if (arg == "i8_scalar")    run_i8_scalar = true;
+            else if (arg == "i8_sve")       run_i8_sve = true;
+            else if (arg == "i8mm")         run_i8mm = true;
+            else if (arg == "fp8")          run_fp8_scalar = run_fp8_sve = run_fp8_opt = run_fp8_preshift = run_fp8_preshift_opt = true;
+            else if (arg == "i8")           run_i8_scalar = run_i8_sve = run_i8mm = true;
+            else if (arg == "-h" || arg == "--help") {
+                printf("Usage: %s [kernels...]\n", argv[0]);
+                printf("  all               Run all kernels (default)\n");
+                printf("  fp8_scalar        FP8 scalar lookup\n");
+                printf("  fp8_sve           FP8 SVE lookup\n");
+                printf("  fp8_opt           FP8 SVE optimized\n");
+                printf("  fp8_preshift      FP8 SVE preshift\n");
+                printf("  fp8_preshift_opt  FP8 SVE preshift_opt\n");
+                printf("  fp16              FP16 SVE fmla\n");
+                printf("  i8_scalar         INT8 scalar\n");
+                printf("  i8_sve            INT8 SVE sdot\n");
+                printf("  i8mm              INT8 I8MM smmla\n");
+                printf("  fp8               All FP8 lookup kernels\n");
+                printf("  i8                All INT8 kernels\n");
+                printf("  -h, --help        Show this help\n");
+                return 0;
+            }
+            else {
+                printf("Unknown arg: %s (use -h for help)\n", argv[a]);
+                return 1;
+            }
+        }
+    }
+
+    if (run_all) {
+        run_fp8_scalar = run_fp8_sve = run_fp8_opt = run_fp8_preshift = run_fp8_preshift_opt = true;
+        run_fp16 = true;
+        run_i8_scalar = run_i8_sve = run_i8mm = true;
+    }
+
+    // 预热
     int loopCnt = 10000;
     int warmup = 100;
-    // 预热（所有kernel都跑一遍warmup次）
     std::cout << "Warming up (" << warmup << " iterations per kernel)..." << std::endl;
     for (int i = 0; i < warmup; ++i) {
-        matmul_fp8_lookup_scalar(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L);
-        matmul_fp8_lookup_sve(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L);
-        matmul_fp8_lookup_sve_optimized(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L);
-        matmul_fp8_lookup_sve_preshift(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L);
-        matmul_fp8_lookup_sve_preshift_opt(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L);
-        matmul_sve_fp16(a_fp16.data(), b_fp16.data(), res.data(), g_N, g_S, g_L);
-        matmul_int8_scalar(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
-        matmul_int8_sve(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
-        matmul_int8_i8mm_complete(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+        if (run_fp8_scalar)      matmul_fp8_lookup_scalar(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L);
+        if (run_fp8_sve)         matmul_fp8_lookup_sve(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L);
+        if (run_fp8_opt)         matmul_fp8_lookup_sve_optimized(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L);
+        if (run_fp8_preshift)    matmul_fp8_lookup_sve_preshift(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L);
+        if (run_fp8_preshift_opt) matmul_fp8_lookup_sve_preshift_opt(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L);
+        if (run_fp16)            matmul_sve_fp16(a_fp16.data(), b_fp16.data(), res.data(), g_N, g_S, g_L);
+        if (run_i8_scalar)       matmul_int8_scalar(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+        if (run_i8_sve)          matmul_int8_sve(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+        if (run_i8mm)            matmul_int8_i8mm_complete(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
     }
     // 复位计数器（预热不计入统计）
-    RESET_STATS(g_stats_fp8_scalar);
-    RESET_STATS(g_stats_fp8_sve);
-    RESET_STATS(g_stats_fp8_sve_opt);
-    RESET_STATS(g_stats_fp8_preshift);
-    RESET_STATS(g_stats_preshift_opt);
-    RESET_STATS(g_stats_fp16);
-    RESET_STATS(g_stats_i8_scalar);
-    RESET_STATS(g_stats_i8_sve);
-    RESET_STATS(g_stats_i8mm);
+    if (run_fp8_scalar)      RESET_STATS(g_stats_fp8_scalar);
+    if (run_fp8_sve)         RESET_STATS(g_stats_fp8_sve);
+    if (run_fp8_opt)         RESET_STATS(g_stats_fp8_sve_opt);
+    if (run_fp8_preshift)    RESET_STATS(g_stats_fp8_preshift);
+    if (run_fp8_preshift_opt) RESET_STATS(g_stats_preshift_opt);
+    if (run_fp16)            RESET_STATS(g_stats_fp16);
+    if (run_i8_scalar)       RESET_STATS(g_stats_i8_scalar);
+    if (run_i8_sve)          RESET_STATS(g_stats_i8_sve);
+    if (run_i8mm)            RESET_STATS(g_stats_i8mm);
 
     {  // 查表计算
-        std::cout << "\nComputing FP8 LUT MatMul..." << std::endl;
+        bool any_fp8 = run_fp8_scalar || run_fp8_sve || run_fp8_opt || run_fp8_preshift || run_fp8_preshift_opt;
+        if (any_fp8) std::cout << "\nComputing FP8 LUT MatMul..." << std::endl;
         std::vector<float> times(loopCnt);
-        for (int i = 0; i < loopCnt; ++i) {
-            TimoPoint tpBegin = std::chrono::high_resolution_clock::now();
-            matmul_fp8_lookup_scalar(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L);
-            TimoPoint tpEnd = std::chrono::high_resolution_clock::now();
-            times[i] = (tpEnd - tpBegin).count() / 1000;
+        if (run_fp8_scalar) {
+            for (int i = 0; i < loopCnt; ++i) {
+                TimoPoint tpBegin = std::chrono::high_resolution_clock::now();
+                matmul_fp8_lookup_scalar(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L);
+                TimoPoint tpEnd = std::chrono::high_resolution_clock::now();
+                times[i] = (tpEnd - tpBegin).count() / 1000;
+            }
+            std::cout << "FP8 lookup scalar dura = " << Average(times) << " us" << std::endl;
         }
-        std::cout << "FP8 lookup scalar dura = " << Average(times) << " us" << std::endl;
-        for (int i = 0; i < loopCnt; ++i) {
-            TimoPoint tpBegin = std::chrono::high_resolution_clock::now();
-            matmul_fp8_lookup_sve(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L);
-            TimoPoint tpEnd = std::chrono::high_resolution_clock::now();
-            times[i] = (tpEnd - tpBegin).count() / 1000;
+        if (run_fp8_sve) {
+            for (int i = 0; i < loopCnt; ++i) {
+                TimoPoint tpBegin = std::chrono::high_resolution_clock::now();
+                matmul_fp8_lookup_sve(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L);
+                TimoPoint tpEnd = std::chrono::high_resolution_clock::now();
+                times[i] = (tpEnd - tpBegin).count() / 1000;
+            }
+            std::cout << "FP8 lookup sve dura = " << Average(times) << " us" << std::endl;
         }
-        std::cout << "FP8 lookup sve dura = " << Average(times) << " us" << std::endl;
-        for (int i = 0; i < loopCnt; ++i) {
-            TimoPoint tpBegin = std::chrono::high_resolution_clock::now();
-            matmul_fp8_lookup_sve_optimized(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L);
-            TimoPoint tpEnd = std::chrono::high_resolution_clock::now();
-            times[i] = (tpEnd - tpBegin).count() / 1000;
+        if (run_fp8_opt) {
+            for (int i = 0; i < loopCnt; ++i) {
+                TimoPoint tpBegin = std::chrono::high_resolution_clock::now();
+                matmul_fp8_lookup_sve_optimized(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L);
+                TimoPoint tpEnd = std::chrono::high_resolution_clock::now();
+                times[i] = (tpEnd - tpBegin).count() / 1000;
+            }
+            std::cout << "FP8 lookup sve opt dura = " << Average(times) << " us" << std::endl;
         }
-        std::cout << "FP8 lookup sve opt dura = " << Average(times) << " us" << std::endl;
 
-        // 预移位 A（一次性预处理，单独计时）
-        TimoPoint tpPreshiftBegin = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < g_N * g_L; ++i) {
-            A_shifted[i] = (uint32_t)a_fp8[i] << 8;
+        if (run_fp8_preshift || run_fp8_preshift_opt) {
+            // 预移位 A（一次性预处理，单独计时）
+            TimoPoint tpPreshiftBegin = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < g_N * g_L; ++i) A_shifted[i] = (uint32_t)a_fp8[i] << 8;
+            volatile uint32_t sink = 0;
+            for (int i = 0; i < g_N * g_L; i += 64 / sizeof(uint32_t)) sink += A_shifted[i];
+            TimoPoint tpPreshiftEnd = std::chrono::high_resolution_clock::now();
+            double preshift_us = (tpPreshiftEnd - tpPreshiftBegin).count() / 1000.0;
+            std::cout << "A_shifted preprocess dura = " << preshift_us << " us (one-time)" << std::endl;
         }
-        // Cache 预热：读回 A_shifted，确保其在 L1/L2 中
-        volatile uint32_t sink = 0;
-        for (int i = 0; i < g_N * g_L; i += 64 / sizeof(uint32_t)) {
-            sink += A_shifted[i];
+        if (run_fp8_preshift) {
+            for (int i = 0; i < loopCnt; ++i) {
+                TimoPoint tpBegin = std::chrono::high_resolution_clock::now();
+                matmul_fp8_lookup_sve_preshift(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L);
+                TimoPoint tpEnd = std::chrono::high_resolution_clock::now();
+                times[i] = (tpEnd - tpBegin).count() / 1000;
+            }
+            std::cout << "FP8 lookup sve preshift dura = " << Average(times) << " us" << std::endl;
         }
-        TimoPoint tpPreshiftEnd = std::chrono::high_resolution_clock::now();
-        double preshift_us = (tpPreshiftEnd - tpPreshiftBegin).count() / 1000.0;
-        std::cout << "A_shifted preprocess dura = " << preshift_us << " us (one-time)" << std::endl;
-
-        // preshift 版：A 已预移位，循环内无 alloc/shift 开销
-        for (int i = 0; i < loopCnt; ++i) {
-            TimoPoint tpBegin = std::chrono::high_resolution_clock::now();
-            matmul_fp8_lookup_sve_preshift(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L);
-            TimoPoint tpEnd = std::chrono::high_resolution_clock::now();
-            times[i] = (tpEnd - tpBegin).count() / 1000;
+        if (run_fp8_preshift_opt) {
+            for (int i = 0; i < loopCnt; ++i) {
+                TimoPoint tpBegin = std::chrono::high_resolution_clock::now();
+                matmul_fp8_lookup_sve_preshift_opt(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L);
+                TimoPoint tpEnd = std::chrono::high_resolution_clock::now();
+                times[i] = (tpEnd - tpBegin).count() / 1000;
+            }
+            std::cout << "FP8 lookup sve preshift_opt dura = " << Average(times) << " us" << std::endl;
         }
-        std::cout << "FP8 lookup sve preshift dura = " << Average(times) << " us" << std::endl;
-
-        // preshift_opt 版：A_shifted 行预取 + gather 预取 + 循环展开
-        for (int i = 0; i < loopCnt; ++i) {
-            TimoPoint tpBegin = std::chrono::high_resolution_clock::now();
-            matmul_fp8_lookup_sve_preshift_opt(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L);
-            TimoPoint tpEnd = std::chrono::high_resolution_clock::now();
-            times[i] = (tpEnd - tpBegin).count() / 1000;
-        }
-        std::cout << "FP8 lookup sve preshift_opt dura = " << Average(times) << " us" << std::endl;
-        // std::chrono::nanoseconds dura1 = tpAfterFP8LookupScalar - tpBegin;
-        // std::chrono::nanoseconds dura2 = tpAfterFP8LookupSve - tpAfterFP8LookupScalar;
-        // std::chrono::nanoseconds dura3 = tpAfterFP8LookupSveOpt - tpAfterFP8LookupSve;
-        // std::cout << "FP8 lookup scalar dura = " << dura1.count() / loopCnt / 1000.0 << " us" << std::endl;
-        // std::cout << "FP8 lookup sve dura = " << dura2.count() / loopCnt / 1000.0 << " us" << std::endl;
-        // std::cout << "FP8 lookup sve opt dura = " << dura3.count() / loopCnt / 1000.0 << " us" << std::endl;
     }
-    {  // FP16 指令加速计算
+    if (run_fp16) {  // FP16 指令加速计算
         std::cout << "Computing FP16 sve MatMul..." << std::endl;
-        TimoPoint tpBegin = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < loopCnt; ++i) {
-            matmul_sve_fp16(a_fp16.data(), b_fp16.data(), res.data(), g_N, g_S, g_L);
-        }
-        TimoPoint tpAfterFP16SveMatMul = std::chrono::high_resolution_clock::now();
-        std::chrono::nanoseconds dura1 = tpAfterFP16SveMatMul - tpBegin;
-        std::cout << "FP16 sve mat mul dura = " << dura1.count() / loopCnt / 1000.0 << " us" << std::endl;
+        TimoPoint t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < loopCnt; ++i) matmul_sve_fp16(a_fp16.data(), b_fp16.data(), res.data(), g_N, g_S, g_L);
+        TimoPoint t1 = std::chrono::high_resolution_clock::now();
+        std::cout << "FP16 sve mat mul dura = " << (t1 - t0).count() / loopCnt / 1000.0 << " us" << std::endl;
     }
-    {  // i8矩阵乘法运算
+    if (run_i8_scalar || run_i8_sve || run_i8mm) {  // i8矩阵乘法运算
         std::cout << "Computing i8 MatMul..." << std::endl;
-        TimoPoint tpBegin = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < loopCnt; ++i) {
-            matmul_int8_scalar(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+        if (run_i8_scalar) {
+            TimoPoint t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < loopCnt; ++i) matmul_int8_scalar(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+            TimoPoint t1 = std::chrono::high_resolution_clock::now();
+            std::cout << "i8 scalar mat mul dura = " << (t1 - t0).count() / loopCnt / 1000.0 << " us" << std::endl;
         }
-        TimoPoint tpAfterI8ScalarMatMul = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < loopCnt; ++i) {
-            matmul_int8_sve(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+        if (run_i8_sve) {
+            TimoPoint t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < loopCnt; ++i) matmul_int8_sve(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+            TimoPoint t1 = std::chrono::high_resolution_clock::now();
+            std::cout << "i8 sve mat mul dura = " << (t1 - t0).count() / loopCnt / 1000.0 << " us" << std::endl;
         }
-        TimoPoint tpAfterI8SveMatMul = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < loopCnt; ++i) {
-            matmul_int8_i8mm_complete(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+        if (run_i8mm) {
+            TimoPoint t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < loopCnt; ++i) matmul_int8_i8mm_complete(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+            TimoPoint t1 = std::chrono::high_resolution_clock::now();
+            std::cout << "i8 mm mat mul dura = " << (t1 - t0).count() / loopCnt / 1000.0 << " us" << std::endl;
         }
-        TimoPoint tpAfterI8mmMatMul = std::chrono::high_resolution_clock::now();
-        std::chrono::nanoseconds dura1 = tpAfterI8ScalarMatMul - tpBegin;
-        std::chrono::nanoseconds dura2 = tpAfterI8SveMatMul - tpAfterI8ScalarMatMul;
-        std::chrono::nanoseconds dura3 = tpAfterI8mmMatMul - tpAfterI8SveMatMul;
-
-        std::cout << "i8 scalar mat mul dura = " << dura1.count() / loopCnt / 1000.0 << " us" << std::endl;
-        std::cout << "i8 sve mat mul dura = " << dura2.count() / loopCnt / 1000.0 << " us" << std::endl;
-        std::cout << "i8 mm mat mul dura = " << dura3.count() / loopCnt / 1000.0 << " us" << std::endl;
     }
-
-    // ─── Cache miss 率测量（perf_event_open, 100 次迭代） ───
+    // ─── Cache miss 率测量（perf_event_open） ───
     {
-        std::cout << "\n--- Cache Miss Rates (L1/L2) ---\n";
-        std::cout << std::left << std::setw(32) << "Kernel"
-                  << std::setw(14) << "L1-miss%"
-                  << std::setw(14) << "L2-miss%" << "\n";
-        std::cout << std::string(60, '-') << "\n";
+        bool any_cache = run_fp8_scalar || run_fp8_sve || run_fp8_opt || run_fp8_preshift || run_fp8_preshift_opt
+                      || run_fp16 || run_i8_scalar || run_i8_sve || run_i8mm;
+        if (any_cache) {
+            std::cout << "\n--- Cache Miss Rates (L1/L2) ---\n";
+            std::cout << std::left << std::setw(32) << "Kernel"
+                      << std::setw(14) << "L1-miss%"
+                      << std::setw(14) << "L2-miss%" << "\n";
+            std::cout << std::string(60, '-') << "\n";
+        }
 
         auto report = [&](const std::string &name, const std::function<void()> &fn) {
             CacheCounters cc = measure_cache(fn, 10, 100);
@@ -868,16 +935,16 @@ int main()
             std::cout << "\n";
         };
 
-        report("FP8 标量查表",     [&](){ matmul_fp8_lookup_scalar(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L); });
-        report("FP8 SVE 查表",     [&](){ matmul_fp8_lookup_sve(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L); });
-        report("FP8 SVE 优化版",   [&](){ matmul_fp8_lookup_sve_optimized(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L); });
-        report("FP8 SVE preshift", [&](){ matmul_fp8_lookup_sve_preshift(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L); });
-        report("FP8 SVE preshift_opt", [&](){ matmul_fp8_lookup_sve_preshift_opt(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L); });
-        report("FP16 SVE fmla",    [&](){ matmul_sve_fp16(a_fp16.data(), b_fp16.data(), res.data(), g_N, g_S, g_L); });
-        report("INT8 \xe6\xa0\x87\xe9\x87\x8f", [&](){ matmul_int8_scalar(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
-        report("INT8 SVE sdot",    [&](){ matmul_int8_sve(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
-        report("INT8 I8MM smmla",  [&](){ matmul_int8_i8mm_complete(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
-        std::cout << "\n";
+        if (run_fp8_scalar)      report("FP8 标量查表",     [&](){ matmul_fp8_lookup_scalar(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L); });
+        if (run_fp8_sve)         report("FP8 SVE 查表",     [&](){ matmul_fp8_lookup_sve(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L); });
+        if (run_fp8_opt)         report("FP8 SVE 优化版",   [&](){ matmul_fp8_lookup_sve_optimized(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L); });
+        if (run_fp8_preshift)    report("FP8 SVE preshift", [&](){ matmul_fp8_lookup_sve_preshift(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L); });
+        if (run_fp8_preshift_opt) report("FP8 SVE preshift_opt", [&](){ matmul_fp8_lookup_sve_preshift_opt(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L); });
+        if (run_fp16)            report("FP16 SVE fmla",    [&](){ matmul_sve_fp16(a_fp16.data(), b_fp16.data(), res.data(), g_N, g_S, g_L); });
+        if (run_i8_scalar)       report("INT8 标量", [&](){ matmul_int8_scalar(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
+        if (run_i8_sve)          report("INT8 SVE sdot",    [&](){ matmul_int8_sve(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
+        if (run_i8mm)            report("INT8 I8MM smmla",  [&](){ matmul_int8_i8mm_complete(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
+        if (any_cache) std::cout << "\n";
     }
 
     print_all_stats();
