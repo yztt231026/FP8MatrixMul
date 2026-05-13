@@ -26,6 +26,7 @@ void load_bin(const std::string &path, T *data, size_t size)
 #include <cstring>
 #include <functional>
 #include <iomanip>
+#include <sys/ioctl.h>
 #include <linux/perf_event.h>
 #include <sys/syscall.h>
 #include <unistd.h>
