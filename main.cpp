@@ -24,6 +24,80 @@ void load_bin(const std::string &path, T *data, size_t size)
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <iomanip>
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+// ─── PMU 性能计数器（perf_event_open） ─────────────────────
+class PerfCounter {
+    int fd_ = -1;
+    static long sys_open(struct perf_event_attr *pea, pid_t pid, int cpu,
+                         int group_fd, unsigned long flags) {
+        return syscall(__NR_perf_event_open, pea, pid, cpu, group_fd, flags);
+    }
+public:
+    PerfCounter(uint64_t config, bool exclude_kernel = true) {
+        struct perf_event_attr pea{};
+        pea.type = PERF_TYPE_RAW;
+        pea.size = sizeof(pea);
+        pea.config = config;
+        pea.disabled = 1;
+        pea.pinned = 1;
+        pea.exclude_kernel = exclude_kernel ? 1 : 0;
+        pea.exclude_hv = 1;
+        fd_ = sys_open(&pea, 0, -1, -1, 0);
+    }
+    ~PerfCounter() { if (fd_ >= 0) close(fd_); }
+    bool ok() const { return fd_ >= 0; }
+    void enable()  { if (fd_ >= 0) ioctl(fd_, PERF_EVENT_IOC_ENABLE, 0); }
+    void disable() { if (fd_ >= 0) ioctl(fd_, PERF_EVENT_IOC_DISABLE, 0); }
+    void reset()   { if (fd_ >= 0) ioctl(fd_, PERF_EVENT_IOC_RESET, 0); }
+    uint64_t read() {
+        uint64_t val = 0;
+        if (fd_ >= 0 && ::read(fd_, &val, sizeof(val)) == sizeof(val)) return val;
+        return 0;
+    }
+};
+
+/** ARMv8 PMU 事件编码（鲲鹏 920 兼容） */
+namespace ArmPmu {
+    constexpr uint64_t L1D_CACHE        = 0x04;
+    constexpr uint64_t L1D_CACHE_REFILL = 0x03;
+    constexpr uint64_t L2D_CACHE        = 0x16;
+    constexpr uint64_t L2D_CACHE_REFILL = 0x17;
+}
+
+struct CacheCounters {
+    uint64_t l1_access = 0, l1_refill = 0, l2_access = 0, l2_refill = 0;
+    bool ok = false;
+};
+
+/** 运行 fn() repeat 次，累计 L1/L2 miss 计数并计算 miss 率 */
+CacheCounters measure_cache(const std::function<void()> &fn, int warmup = 10, int repeat = 100) {
+    CacheCounters cc;
+    for (int i = 0; i < warmup; ++i) fn();
+
+    PerfCounter c_l1a(ArmPmu::L1D_CACHE);
+    PerfCounter c_l1r(ArmPmu::L1D_CACHE_REFILL);
+    PerfCounter c_l2a(ArmPmu::L2D_CACHE);
+    PerfCounter c_l2r(ArmPmu::L2D_CACHE_REFILL);
+    if (!c_l1a.ok() || !c_l1r.ok() || !c_l2a.ok() || !c_l2r.ok())
+        return cc;
+
+    c_l1a.reset(); c_l1r.reset(); c_l2a.reset(); c_l2r.reset();
+    c_l1a.enable(); c_l1r.enable(); c_l2a.enable(); c_l2r.enable();
+    for (int i = 0; i < repeat; ++i) fn();
+    c_l1a.disable(); c_l1r.disable(); c_l2a.disable(); c_l2r.disable();
+
+    cc.l1_access = c_l1a.read();
+    cc.l1_refill = c_l1r.read();
+    cc.l2_access = c_l2a.read();
+    cc.l2_refill = c_l2r.read();
+    cc.ok = true;
+    return cc;
+}
 
 // ─── 动态指令计数器（方案 C：代码插桩） ─────────────────────
 struct KernelStats {
@@ -747,6 +821,43 @@ int main()
         std::cout << "i8 sve mat mul dura = " << dura2.count() / loopCnt / 1000.0 << " us" << std::endl;
         std::cout << "i8 mm mat mul dura = " << dura3.count() / loopCnt / 1000.0 << " us" << std::endl;
     }
+
+    // ─── Cache miss 率测量（perf_event_open, 100 次迭代） ───
+    {
+        std::cout << "\n--- Cache Miss Rates (L1/L2) ---\n";
+        std::cout << std::left << std::setw(32) << "Kernel"
+                  << std::setw(14) << "L1-miss%"
+                  << std::setw(14) << "L2-miss%" << "\n";
+        std::cout << std::string(60, '-') << "\n";
+
+        auto report = [&](const std::string &name, const std::function<void()> &fn) {
+            CacheCounters cc = measure_cache(fn, 10, 100);
+            std::cout << std::left << std::setw(32) << name;
+            if (cc.ok && cc.l1_access > 0 && cc.l2_access > 0) {
+                double l1 = 100.0 * cc.l1_refill / cc.l1_access;
+                double l2 = 100.0 * cc.l2_refill / cc.l2_access;
+                std::cout << std::fixed << std::setprecision(2)
+                          << std::setw(14) << l1
+                          << std::setw(14) << l2 << "%";
+            } else if (!cc.ok) {
+                std::cout << std::setw(14) << "N/A" << std::setw(14) << "N/A (non-ARM?)";
+            } else {
+                std::cout << std::setw(14) << "0?" << std::setw(14) << "0?";
+            }
+            std::cout << "\n";
+        };
+
+        report("FP8 标量查表",     [&](){ matmul_fp8_lookup_scalar(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L); });
+        report("FP8 SVE 查表",     [&](){ matmul_fp8_lookup_sve(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L); });
+        report("FP8 SVE 优化版",   [&](){ matmul_fp8_lookup_sve_optimized(lut.data(), a_fp8.data(), b_fp8.data(), res.data(), g_N, g_S, g_L); });
+        report("FP8 SVE preshift", [&](){ matmul_fp8_lookup_sve_preshift(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L); });
+        report("FP8 SVE preshift_opt", [&](){ matmul_fp8_lookup_sve_preshift_opt(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L); });
+        report("FP16 SVE fmla",    [&](){ matmul_sve_fp16(a_fp16.data(), b_fp16.data(), res.data(), g_N, g_S, g_L); });
+        report("INT8 SVE sdot",    [&](){ matmul_int8_sve(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
+        report("INT8 I8MM smmla",  [&](){ matmul_int8_i8mm_complete(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
+        std::cout << "\n";
+    }
+
     print_all_stats();
     free(A_shifted);
     return 0;
