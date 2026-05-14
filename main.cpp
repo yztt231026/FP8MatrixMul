@@ -27,6 +27,7 @@ void load_bin(const std::string &path, T *data, size_t size)
 #include <string>
 #include <functional>
 #include <iomanip>
+#include <omp.h>
 #include <sys/ioctl.h>
 #include <linux/perf_event.h>
 #include <sys/syscall.h>
@@ -573,6 +574,63 @@ T Average(std::vector<T> &datas)
     return sum / datas.size();
 }
 
+// ─── 多核并行版：OpenMP 行拆分，处理 [i_start, i_end) 行 ───
+static void matmul_fp8_rows(const float *table, const uint32_t *A_shifted,
+                             const uint8_t *B_T, float *C,
+                             int N, int S, int L, int i_start, int i_end)
+{
+    for (int i = i_start; i < i_end; ++i) {
+        const uint32_t *rowA_sh = A_shifted + i * L;
+        for (int off = 0; off < L; off += 64 / sizeof(uint32_t))
+            __builtin_prefetch(&rowA_sh[off], 0, 3);
+
+        for (int j = 0; j < S; ++j) {
+            const uint8_t *rowB = B_T + j * L;
+            svfloat32_t acc_v = svdup_n_f32(0.0f);
+            int k = 0;
+            int step = svcntw() * 2;
+            while (k + step <= L) {
+                svbool_t pg = svptrue_b32();
+                svuint32_t va = svld1_u32(pg, &rowA_sh[k]);
+                svuint32_t vb = svld1ub_u32(pg, &rowB[k]);
+                svfloat32_t vals = svld1_gather_u32index_f32(pg, table, svorr_u32_z(pg, va, vb));
+                acc_v = svadd_f32_z(pg, acc_v, vals);
+                va = svld1_u32(pg, &rowA_sh[k + svcntw()]);
+                vb = svld1ub_u32(pg, &rowB[k + svcntw()]);
+                vals = svld1_gather_u32index_f32(pg, table, svorr_u32_z(pg, va, vb));
+                acc_v = svadd_f32_z(pg, acc_v, vals);
+                k += step;
+            }
+            svbool_t pg = svwhilelt_b32(k, L);
+            while (svptest_any(svptrue_b32(), pg)) {
+                svbool_t pg2 = svwhilelt_b32(k, L);
+                svuint32_t va = svld1_u32(pg2, &rowA_sh[k]);
+                svuint32_t vb = svld1ub_u32(pg2, &rowB[k]);
+                svfloat32_t vals = svld1_gather_u32index_f32(pg2, table, svorr_u32_z(pg2, va, vb));
+                acc_v = svadd_f32_z(pg2, acc_v, vals);
+                k += svcntw();
+                pg = svwhilelt_b32(k, L);
+            }
+            C[i * S + j] = svaddv_f32(svptrue_b32(), acc_v);
+        }
+    }
+}
+
+static void matmul_fp8_multicore(const float *table, const uint32_t *A_shifted,
+                                  const uint8_t *B_T, float *C,
+                                  int N, int S, int L, int num_threads)
+{
+    #pragma omp parallel num_threads(num_threads)
+    {
+        int t = omp_get_thread_num();
+        int nt = omp_get_num_threads();
+        int rows_per = (N + nt - 1) / nt;
+        int i_start = t * rows_per;
+        int i_end = std::min(i_start + rows_per, N);
+        matmul_fp8_rows(table, A_shifted, B_T, C, N, S, L, i_start, i_end);
+    }
+}
+
 int main(int argc, char **argv)
 {
     // 分配内存
@@ -606,6 +664,7 @@ int main(int argc, char **argv)
     bool run_fp8_scalar = false, run_fp8_sve = false, run_fp8_opt = false;
     bool run_fp8_preshift = false, run_fp8_preshift_opt = false;
     bool run_fp16 = false, run_i8_scalar = false, run_i8_sve = false, run_i8mm = false;
+    bool run_multicore = false;
 
     if (argc > 1) {
         run_all = false;
@@ -623,6 +682,7 @@ int main(int argc, char **argv)
             else if (arg == "i8mm")         run_i8mm = true;
             else if (arg == "fp8")          run_fp8_scalar = run_fp8_sve = run_fp8_opt = run_fp8_preshift = run_fp8_preshift_opt = true;
             else if (arg == "i8")           run_i8_scalar = run_i8_sve = run_i8mm = true;
+            else if (arg == "multicore")    run_multicore = true;
             else if (arg == "-h" || arg == "--help") {
                 printf("Usage: %s [kernels...]\n", argv[0]);
                 printf("  all               Run all kernels (default)\n");
@@ -637,6 +697,7 @@ int main(int argc, char **argv)
                 printf("  i8mm              INT8 I8MM smmla\n");
                 printf("  fp8               All FP8 lookup kernels\n");
                 printf("  i8                All INT8 kernels\n");
+                printf("  multicore         FP8 SVE 多核扩展实验 (1/2/4/8/16/32/64 核)\n");
                 printf("  -h, --help        Show this help\n");
                 return 0;
             }
@@ -796,6 +857,85 @@ int main(int argc, char **argv)
         if (run_i8_sve)          report("INT8 SVE sdot",    [&](){ matmul_int8_sve(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
         if (run_i8mm)            report("INT8 I8MM smmla",  [&](){ matmul_int8_i8mm_complete(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
         if (any_cache) std::cout << "\n";
+    }
+
+    // ─── 多核 FP8 SVE 扩展实验 ───
+    if (run_multicore) {
+        const int max_cores = omp_get_max_threads();
+        int thread_counts[] = {1, 2, 4, 8, 16, 32, 64};
+        int num_configs = 0;
+        for (int c : thread_counts) {
+            if (c <= max_cores) num_configs++;
+            else break;
+        }
+
+        std::cout << "\n══════════════════════════════════════════════════════════\n";
+        std::cout << "多核 FP8 SVE preshift_opt 性能\n";
+        std::cout << "LUT = 256×256 float (256 KiB, 全部 L2 resident)\n";
+        std::cout << "N=" << g_N << " S=" << g_S << " L=" << g_L;
+        std::cout << "  核数上限=" << max_cores << "\n";
+        std::cout << "══════════════════════════════════════════════════════════\n";
+        std::cout << std::left << std::setw(8) << "Cores"
+                  << std::setw(16) << "Time(μs)"
+                  << std::setw(14) << "GOP/s"
+                  << std::setw(12) << "Speedup"
+                  << std::setw(14) << "L1-miss%"
+                  << std::setw(14) << "L2-miss%" << "\n";
+        std::cout << std::string(78, '-') << "\n";
+
+        int mc_warmup = 10, mc_repeat = 100;
+        double base_time = 0;
+
+        for (int ti = 0; ti < num_configs; ++ti) {
+            int tc = thread_counts[ti];
+            auto fn = [&]() { matmul_fp8_multicore(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L, tc); };
+
+            // Warmup
+            for (int i = 0; i < mc_warmup; ++i) fn();
+
+            // Timing
+            TimoPoint t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < mc_repeat; ++i) fn();
+            TimoPoint t1 = std::chrono::high_resolution_clock::now();
+            double avg_us = (t1 - t0).count() / (double)mc_repeat / 1000.0;
+
+            double gops = 2.0 * g_N * g_S * g_L / avg_us / 1e6;
+            double speedup = (tc == 1) ? 1.0 : base_time / avg_us;
+            if (tc == 1) base_time = avg_us;
+
+            // Cache miss（进程级 aggregate）
+            PerfCounter c_l1a(ArmPmu::L1D_CACHE);
+            PerfCounter c_l1r(ArmPmu::L1D_CACHE_REFILL);
+            PerfCounter c_l2a(ArmPmu::L2D_CACHE);
+            PerfCounter c_l2r(ArmPmu::L2D_CACHE_REFILL);
+            bool cache_ok = c_l1a.ok() && c_l1r.ok() && c_l2a.ok() && c_l2r.ok();
+            double l1_mr = 0, l2_mr = 0;
+            if (cache_ok) {
+                c_l1a.reset(); c_l1r.reset(); c_l2a.reset(); c_l2r.reset();
+                c_l1a.enable(); c_l1r.enable(); c_l2a.enable(); c_l2r.enable();
+                int cache_rep = 20;
+                for (int i = 0; i < cache_rep; ++i) fn();
+                c_l1a.disable(); c_l1r.disable(); c_l2a.disable(); c_l2r.disable();
+                uint64_t l1a_v = c_l1a.read(), l1r_v = c_l1r.read();
+                uint64_t l2a_v = c_l2a.read(), l2r_v = c_l2r.read();
+                if (l1a_v && l2a_v) {
+                    l1_mr = 100.0 * l1r_v / l1a_v;
+                    l2_mr = 100.0 * l2r_v / l2a_v;
+                } else { cache_ok = false; }
+            }
+
+            std::cout << std::left << std::setw(8) << tc
+                      << std::fixed << std::setprecision(1) << std::setw(16) << avg_us
+                      << std::setprecision(2) << std::setw(14) << gops
+                      << std::setprecision(2) << std::setw(12) << speedup;
+            if (cache_ok)
+                std::cout << std::setprecision(2) << std::setw(14) << l1_mr
+                          << std::setprecision(2) << std::setw(14) << l2_mr << "%";
+            else
+                std::cout << std::setw(14) << "N/A" << std::setw(14) << "N/A";
+            std::cout << "\n";
+        }
+        std::cout << "\n";
     }
 
     free(A_shifted);
