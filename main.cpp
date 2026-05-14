@@ -899,7 +899,7 @@ int main(int argc, char **argv)
             TimoPoint t1 = std::chrono::high_resolution_clock::now();
             double avg_us = (t1 - t0).count() / (double)mc_repeat / 1000.0;
 
-            double gops = 2.0 * g_N * g_S * g_L / avg_us / 1e6;
+            double gops = 1.0 * g_N * g_S * g_L / avg_us / 1000.0;
             double speedup = (tc == 1) ? 1.0 : base_time / avg_us;
             if (tc == 1) base_time = avg_us;
 
