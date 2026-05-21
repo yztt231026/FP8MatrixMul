@@ -2,7 +2,6 @@
 #include <vector>
 #include <fstream>
 #include <numeric>
-#include <unordered_map>
 // #include <arm_neon.h>
 #include <arm_sve.h>
 // 假设 g_S 为 256
@@ -571,13 +570,15 @@ void matmul_int8_scalar_histogram(const int8_t *A, const int8_t *B_T, int32_t *C
     for (int i = 0; i < N; ++i) {
         const int8_t *rowA = A + i * L;
         for (int j = 0; j < S; ++j) {
-            std::unordered_map<int8_t, int32_t> bucket;
+            int32_t bucket[256] = {0};
             const int8_t *rowB = B_T + j * L;
             for (int k = 0; k < L; ++k)
-                bucket[rowA[k]] += (int32_t)rowB[k];
+                bucket[(uint8_t)rowA[k]] += (int32_t)rowB[k];
             int32_t sum = 0;
-            for (auto &[val, cnt] : bucket)
-                sum += (int32_t)val * cnt;
+            for (int v = 0; v < 256; ++v) {
+                int32_t cnt = bucket[v];
+                if (cnt) sum += (int32_t)((int8_t)v) * cnt;
+            }
             C[i * S + j] = sum;
         }
     }
