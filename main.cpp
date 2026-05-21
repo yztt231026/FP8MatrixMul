@@ -572,8 +572,18 @@ void matmul_int8_scalar_histogram(const int8_t *A, const int8_t *B_T, int32_t *C
         for (int j = 0; j < S; ++j) {
             int32_t bucket[256] = {0};
             const int8_t *rowB = B_T + j * L;
-            for (int k = 0; k < L; ++k)
-                bucket[(uint8_t)rowA[k]] += (int32_t)rowB[k];
+            // SVE gather-add-scatter 直方图累加
+            // 注意：同一向量内相同 A 值会导致冲突（多个 lane 写同个 bucket），此处不做特殊处理
+            int k = 0;
+            svbool_t pg = svwhilelt_b8(k, L);
+            while (svptest_any(svptrue_b8(), pg)) {
+                svuint32_t idx = svld1ub_u32(pg, (const uint8_t*)&rowA[k]);
+                svint32_t b32 = svld1sb_s32(pg, &rowB[k]);
+                svint32_t old = svld1_gather_u32index_s32(pg, bucket, idx);
+                svst1_scatter_u32index_s32(pg, bucket, idx, svadd_s32_m(pg, old, b32));
+                k += svcntb();
+                pg = svwhilelt_b8(k, L);
+            }
             // SVE 加速求和：Σ bucket[v] × (int8_t)v
             static int32_t v_vals[256];
             static bool v_init = false;
