@@ -1132,6 +1132,21 @@ int main(int argc, char **argv)
             std::cout << "  估算操作数/点积: 标量=" << std_ops_per_dot
                       << "  直方图=" << hist_ops_per_dot
                       << "  变化=" << (hist_ops_per_dot - std_ops_per_dot) * 100 / std_ops_per_dot << "%" << std::endl;
+            // 校验结果
+            std::vector<int32_t> ref_res(g_N * g_S);
+            matmul_int8_scalar(a_i8.data(), b_i8.data(), ref_res.data(), g_N, g_S, g_L);
+            bool ok = true;
+            int err_cnt = 0;
+            for (int idx = 0; idx < g_N * g_S; ++idx) {
+                if (res_i32[idx] != ref_res[idx]) {
+                    ok = false;
+                    if (++err_cnt <= 5)
+                        std::cout << "    mismatch at (" << idx/g_S << "," << idx%g_S
+                                  << "): hist=" << res_i32[idx] << " ref=" << ref_res[idx] << std::endl;
+                }
+            }
+            std::cout << "  histogram verification: " << (ok ? "PASS" : "FAIL")
+                      << " (errors=" << err_cnt << "/" << (g_N * g_S) << ")" << std::endl;
         }
         if (run_i8mm) {
             TimoPoint t0 = std::chrono::high_resolution_clock::now();
