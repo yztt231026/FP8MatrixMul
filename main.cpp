@@ -438,6 +438,31 @@ void matmul_int8_scalar(const int8_t *A, const int8_t *B_T, int32_t *C, int N, i
         }
     }
 }
+
+/**
+ * INT8 标量 4 累加器版 — 利用结合律拆分加法链，隐藏乘法延迟
+ */
+void matmul_int8_scalar_macc4(const int8_t *A, const int8_t *B_T, int32_t *C, int N, int S, int L)
+{
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j < S; ++j) {
+            const int8_t *rowA = A + i * L;
+            const int8_t *rowB = B_T + j * L;
+
+            int32_t sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;
+            int k = 0;
+            // 主循环：4 条独立累加链，每轮 4 个元素
+            for (; k + 4 <= L; k += 4) {
+                sum0 += (int32_t)rowA[k]   * (int32_t)rowB[k];
+                sum1 += (int32_t)rowA[k+1] * (int32_t)rowB[k+1];
+                sum2 += (int32_t)rowA[k+2] * (int32_t)rowB[k+2];
+                sum3 += (int32_t)rowA[k+3] * (int32_t)rowB[k+3];
+            }
+            for (; k < L; ++k) sum0 += (int32_t)rowA[k] * (int32_t)rowB[k];
+            C[i * S + j] = sum0 + sum1 + sum2 + sum3;
+        }
+    }
+}
 // void matmul_int8_scalar(const int8_t *A, const int8_t *B_T, int32_t *C, int N, int S, int L)
 // {
 //     for (int i = 0; i < N; ++i) {
@@ -487,6 +512,84 @@ void matmul_int8_sve(const int8_t *A, const int8_t *B_T, int32_t *C, int N, int 
                 pg = svwhilelt_b8(k, L);
             }
             C[i * S + j] = svaddv_s32(svptrue_b32(), acc_v);
+        }
+    }
+}
+
+/**
+ * INT8 SVE sdot 双累加器版 — 两条独立 sdot 链流水并行
+ */
+void matmul_int8_sve_macc2(const int8_t *A, const int8_t *B_T, int32_t *C, int N, int S, int L)
+{
+    const int step = svcntb();
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j < S; ++j) {
+            const int8_t *rowA = A + i * L;
+            const int8_t *rowB = B_T + j * L;
+
+            svint32_t acc0 = svdup_n_s32(0);
+            svint32_t acc1 = svdup_n_s32(0);
+
+            int k = 0;
+            // 主循环：2×step 元素，两条独立 sdot 链
+            for (; k + 2 * step <= L; k += 2 * step) {
+                acc0 = svdot_s32(acc0, svld1_s8(svptrue_b8(), &rowA[k]),
+                                       svld1_s8(svptrue_b8(), &rowB[k]));
+                acc1 = svdot_s32(acc1, svld1_s8(svptrue_b8(), &rowA[k + step]),
+                                       svld1_s8(svptrue_b8(), &rowB[k + step]));
+            }
+            svbool_t pg = svwhilelt_b8(k, L);
+            if (svptest_any(svptrue_b8(), pg)) {
+                acc0 = svdot_s32(acc0, svld1_s8(pg, &rowA[k]), svld1_s8(pg, &rowB[k]));
+            }
+            C[i * S + j] = svaddv_s32(svptrue_b32(), svadd_s32_m(svptrue_b32(), acc0, acc1));
+        }
+    }
+}
+
+/**
+ * INT8 SVE sdot 四累加器版 — 四条独立 sdot 链，最大限度隐藏延迟
+ */
+void matmul_int8_sve_macc4(const int8_t *A, const int8_t *B_T, int32_t *C, int N, int S, int L)
+{
+    const int step = svcntb();
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j < S; ++j) {
+            const int8_t *rowA = A + i * L;
+            const int8_t *rowB = B_T + j * L;
+
+            svint32_t acc0 = svdup_n_s32(0);
+            svint32_t acc1 = svdup_n_s32(0);
+            svint32_t acc2 = svdup_n_s32(0);
+            svint32_t acc3 = svdup_n_s32(0);
+
+            int k = 0;
+            // 主循环：4×step 元素，四条独立链
+            for (; k + 4 * step <= L; k += 4 * step) {
+                acc0 = svdot_s32(acc0, svld1_s8(svptrue_b8(), &rowA[k]),
+                                       svld1_s8(svptrue_b8(), &rowB[k]));
+                acc1 = svdot_s32(acc1, svld1_s8(svptrue_b8(), &rowA[k + step]),
+                                       svld1_s8(svptrue_b8(), &rowB[k + step]));
+                acc2 = svdot_s32(acc2, svld1_s8(svptrue_b8(), &rowA[k + 2*step]),
+                                       svld1_s8(svptrue_b8(), &rowB[k + 2*step]));
+                acc3 = svdot_s32(acc3, svld1_s8(svptrue_b8(), &rowA[k + 3*step]),
+                                       svld1_s8(svptrue_b8(), &rowB[k + 3*step]));
+            }
+            // 剩余 2×step
+            for (; k + 2 * step <= L; k += 2 * step) {
+                acc0 = svdot_s32(acc0, svld1_s8(svptrue_b8(), &rowA[k]),
+                                       svld1_s8(svptrue_b8(), &rowB[k]));
+                acc1 = svdot_s32(acc1, svld1_s8(svptrue_b8(), &rowA[k + step]),
+                                       svld1_s8(svptrue_b8(), &rowB[k + step]));
+            }
+            svbool_t pg = svwhilelt_b8(k, L);
+            if (svptest_any(svptrue_b8(), pg)) {
+                acc0 = svdot_s32(acc0, svld1_s8(pg, &rowA[k]), svld1_s8(pg, &rowB[k]));
+            }
+            // 4→2→1 合并
+            svint32_t sum01 = svadd_s32_m(svptrue_b32(), acc0, acc1);
+            svint32_t sum23 = svadd_s32_m(svptrue_b32(), acc2, acc3);
+            C[i * S + j] = svaddv_s32(svptrue_b32(), svadd_s32_m(svptrue_b32(), sum01, sum23));
         }
     }
 }
@@ -664,6 +767,7 @@ int main(int argc, char **argv)
     bool run_fp8_scalar = false, run_fp8_sve = false, run_fp8_opt = false;
     bool run_fp8_preshift = false, run_fp8_preshift_opt = false;
     bool run_fp16 = false, run_i8_scalar = false, run_i8_sve = false, run_i8mm = false;
+    bool run_i8_sve_macc2 = false, run_i8_sve_macc4 = false, run_i8_scalar_macc4 = false;
     bool run_multicore = false;
 
     if (argc > 1) {
@@ -679,6 +783,9 @@ int main(int argc, char **argv)
             else if (arg == "fp16")         run_fp16 = true;
             else if (arg == "i8_scalar")    run_i8_scalar = true;
             else if (arg == "i8_sve")       run_i8_sve = true;
+            else if (arg == "i8_sve_macc2") run_i8_sve_macc2 = true;
+            else if (arg == "i8_sve_macc4") run_i8_sve_macc4 = true;
+            else if (arg == "i8_scalar_macc4") run_i8_scalar_macc4 = true;
             else if (arg == "i8mm")         run_i8mm = true;
             else if (arg == "fp8")          run_fp8_scalar = run_fp8_sve = run_fp8_opt = run_fp8_preshift = run_fp8_preshift_opt = true;
             else if (arg == "i8")           run_i8_scalar = run_i8_sve = run_i8mm = true;
@@ -694,6 +801,9 @@ int main(int argc, char **argv)
                 printf("  fp16              FP16 SVE fmla\n");
                 printf("  i8_scalar         INT8 scalar\n");
                 printf("  i8_sve            INT8 SVE sdot\n");
+                printf("  i8_sve_macc2      INT8 SVE sdot 双累加器\n");
+                printf("  i8_sve_macc4      INT8 SVE sdot 四累加器\n");
+                printf("  i8_scalar_macc4   INT8 标量 四累加器\n");
                 printf("  i8mm              INT8 I8MM smmla\n");
                 printf("  fp8               All FP8 lookup kernels\n");
                 printf("  i8                All INT8 kernels\n");
@@ -727,6 +837,9 @@ int main(int argc, char **argv)
         if (run_fp16)            matmul_sve_fp16(a_fp16.data(), b_fp16.data(), res.data(), g_N, g_S, g_L);
         if (run_i8_scalar)       matmul_int8_scalar(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
         if (run_i8_sve)          matmul_int8_sve(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+        if (run_i8_sve_macc2)    matmul_int8_sve_macc2(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+        if (run_i8_sve_macc4)    matmul_int8_sve_macc4(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+        if (run_i8_scalar_macc4) matmul_int8_scalar_macc4(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
         if (run_i8mm)            matmul_int8_i8mm_complete(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
     }
     {  // 查表计算
@@ -797,7 +910,7 @@ int main(int argc, char **argv)
         TimoPoint t1 = std::chrono::high_resolution_clock::now();
         std::cout << "FP16 sve mat mul dura = " << (t1 - t0).count() / loopCnt / 1000.0 << " us" << std::endl;
     }
-    if (run_i8_scalar || run_i8_sve || run_i8mm) {  // i8矩阵乘法运算
+    if (run_i8_scalar || run_i8_sve || run_i8mm || run_i8_sve_macc2 || run_i8_sve_macc4 || run_i8_scalar_macc4) {  // i8矩阵乘法运算
         std::cout << "Computing i8 MatMul..." << std::endl;
         if (run_i8_scalar) {
             TimoPoint t0 = std::chrono::high_resolution_clock::now();
@@ -811,6 +924,24 @@ int main(int argc, char **argv)
             TimoPoint t1 = std::chrono::high_resolution_clock::now();
             std::cout << "i8 sve mat mul dura = " << (t1 - t0).count() / loopCnt / 1000.0 << " us" << std::endl;
         }
+        if (run_i8_sve_macc2) {
+            TimoPoint t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < loopCnt; ++i) matmul_int8_sve_macc2(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+            TimoPoint t1 = std::chrono::high_resolution_clock::now();
+            std::cout << "i8 sve sdot macc2 dura = " << (t1 - t0).count() / loopCnt / 1000.0 << " us" << std::endl;
+        }
+        if (run_i8_sve_macc4) {
+            TimoPoint t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < loopCnt; ++i) matmul_int8_sve_macc4(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+            TimoPoint t1 = std::chrono::high_resolution_clock::now();
+            std::cout << "i8 sve sdot macc4 dura = " << (t1 - t0).count() / loopCnt / 1000.0 << " us" << std::endl;
+        }
+        if (run_i8_scalar_macc4) {
+            TimoPoint t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < loopCnt; ++i) matmul_int8_scalar_macc4(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+            TimoPoint t1 = std::chrono::high_resolution_clock::now();
+            std::cout << "i8 scalar macc4 dura = " << (t1 - t0).count() / loopCnt / 1000.0 << " us" << std::endl;
+        }
         if (run_i8mm) {
             TimoPoint t0 = std::chrono::high_resolution_clock::now();
             for (int i = 0; i < loopCnt; ++i) matmul_int8_i8mm_complete(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
@@ -821,7 +952,8 @@ int main(int argc, char **argv)
     // ─── Cache miss 率测量（perf_event_open） ───
     {
         bool any_cache = run_fp8_scalar || run_fp8_sve || run_fp8_opt || run_fp8_preshift || run_fp8_preshift_opt
-                      || run_fp16 || run_i8_scalar || run_i8_sve || run_i8mm;
+                      || run_fp16 || run_i8_scalar || run_i8_sve || run_i8mm
+                      || run_i8_sve_macc2 || run_i8_sve_macc4 || run_i8_scalar_macc4;
         if (any_cache) {
             std::cout << "\n--- Cache Miss Rates (L1/L2) ---\n";
             std::cout << std::left << std::setw(32) << "Kernel"
@@ -853,8 +985,11 @@ int main(int argc, char **argv)
         if (run_fp8_preshift)    report("FP8 SVE preshift", [&](){ matmul_fp8_lookup_sve_preshift(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L); });
         if (run_fp8_preshift_opt) report("FP8 SVE preshift_opt", [&](){ matmul_fp8_lookup_sve_preshift_opt(lut.data(), A_shifted, b_fp8.data(), res.data(), g_N, g_S, g_L); });
         if (run_fp16)            report("FP16 SVE fmla",    [&](){ matmul_sve_fp16(a_fp16.data(), b_fp16.data(), res.data(), g_N, g_S, g_L); });
-        if (run_i8_scalar)       report("INT8 标量", [&](){ matmul_int8_scalar(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
+        if (run_i8_scalar)       report("INT8 标量",        [&](){ matmul_int8_scalar(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
         if (run_i8_sve)          report("INT8 SVE sdot",    [&](){ matmul_int8_sve(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
+        if (run_i8_sve_macc2)    report("INT8 SVE sdot macc2", [&](){ matmul_int8_sve_macc2(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
+        if (run_i8_sve_macc4)    report("INT8 SVE sdot macc4", [&](){ matmul_int8_sve_macc4(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
+        if (run_i8_scalar_macc4) report("INT8 标量 macc4",  [&](){ matmul_int8_scalar_macc4(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
         if (run_i8mm)            report("INT8 I8MM smmla",  [&](){ matmul_int8_i8mm_complete(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
         if (any_cache) std::cout << "\n";
     }
