@@ -557,6 +557,32 @@ void matmul_int8_sve_distributive(const int8_t *a_src, const int8_t *B_T, int32_
         }
     }
 }
+
+/**
+ * INT8 标量直方图版 — 以 A 值为 key 分组累加 B_T，利用分配律减少乘法
+ *
+ * C[i][j] = Σ_v v × (Σ_{k: A[i][k]=v} B_T[j][k])
+ * 先按 A 值收集 B_T 列到直方图，再乘 A 值累加。
+ */
+void matmul_int8_scalar_histogram(const int8_t *A, const int8_t *B_T, int32_t *C,
+                                  int N, int S, int L)
+{
+    for (int i = 0; i < N; ++i) {
+        const int8_t *rowA = A + i * L;
+        for (int j = 0; j < S; ++j) {
+            int32_t bucket[256] = {0};
+            const int8_t *rowB = B_T + j * L;
+            for (int k = 0; k < L; ++k)
+                bucket[(uint8_t)rowA[k]] += (int32_t)rowB[k];
+            int32_t sum = 0;
+            for (int v = 0; v < 256; ++v) {
+                int32_t cnt = bucket[v];
+                if (cnt) sum += (int32_t)((int8_t)v) * cnt;
+            }
+            C[i * S + j] = sum;
+        }
+    }
+}
 // void matmul_int8_scalar(const int8_t *A, const int8_t *B_T, int32_t *C, int N, int S, int L)
 // {
 //     for (int i = 0; i < N; ++i) {
@@ -864,6 +890,7 @@ int main(int argc, char **argv)
     bool run_i8_sve_macc2 = false, run_i8_sve_macc4 = false, run_i8_scalar_macc4 = false;
     bool run_i8_distributive = false;
     bool run_i8_sve_distributive = false;
+    bool run_i8_histogram = false;
     bool run_multicore = false;
 
     if (argc > 1) {
@@ -884,6 +911,7 @@ int main(int argc, char **argv)
             else if (arg == "i8_scalar_macc4") run_i8_scalar_macc4 = true;
             else if (arg == "i8_distributive") run_i8_distributive = true;
             else if (arg == "i8_sve_distributive") run_i8_sve_distributive = true;
+            else if (arg == "i8_histogram") run_i8_histogram = true;
             else if (arg == "i8mm")         run_i8mm = true;
             else if (arg == "fp8")          run_fp8_scalar = run_fp8_sve = run_fp8_opt = run_fp8_preshift = run_fp8_preshift_opt = true;
             else if (arg == "i8")           run_i8_scalar = run_i8_sve = run_i8mm = true;
@@ -904,6 +932,7 @@ int main(int argc, char **argv)
                 printf("  i8_scalar_macc4   INT8 标量 四累加器\n");
                 printf("  i8_distributive   INT8 标量 分配律版\n");
                 printf("  i8_sve_distributive INT8 SVE sdot 分配律版\n");
+                printf("  i8_histogram      INT8 标量 直方图分配律版\n");
                 printf("  i8mm              INT8 I8MM smmla\n");
                 printf("  fp8               All FP8 lookup kernels\n");
                 printf("  i8                All INT8 kernels\n");
@@ -942,6 +971,7 @@ int main(int argc, char **argv)
         if (run_i8_scalar_macc4) matmul_int8_scalar_macc4(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
         if (run_i8_distributive) matmul_int8_scalar_distributive(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
         if (run_i8_sve_distributive) matmul_int8_sve_distributive(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+        if (run_i8_histogram)    matmul_int8_scalar_histogram(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
         if (run_i8mm)            matmul_int8_i8mm_complete(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
     }
     {  // 查表计算
@@ -1012,7 +1042,7 @@ int main(int argc, char **argv)
         TimoPoint t1 = std::chrono::high_resolution_clock::now();
         std::cout << "FP16 sve mat mul dura = " << (t1 - t0).count() / loopCnt / 1000.0 << " us" << std::endl;
     }
-    if (run_i8_scalar || run_i8_sve || run_i8mm || run_i8_sve_macc2 || run_i8_sve_macc4 || run_i8_scalar_macc4 || run_i8_distributive || run_i8_sve_distributive) {  // i8矩阵乘法运算
+    if (run_i8_scalar || run_i8_sve || run_i8mm || run_i8_sve_macc2 || run_i8_sve_macc4 || run_i8_scalar_macc4 || run_i8_distributive || run_i8_sve_distributive || run_i8_histogram) {  // i8矩阵乘法运算
         std::cout << "Computing i8 MatMul..." << std::endl;
         if (run_i8_scalar) {
             TimoPoint t0 = std::chrono::high_resolution_clock::now();
@@ -1072,6 +1102,19 @@ int main(int argc, char **argv)
             std::cout << "  sdot 指令数/点积: 标准=" << iters_std << "  分配律=" << iters_dist
                       << "  节省=" << (iters_std - iters_dist) * 100 / iters_std << "%" << std::endl;
         }
+        if (run_i8_histogram) {
+            TimoPoint t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < loopCnt; ++i) matmul_int8_scalar_histogram(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
+            TimoPoint t1 = std::chrono::high_resolution_clock::now();
+            double hist_us = (t1 - t0).count() / loopCnt / 1000.0;
+            std::cout << "i8 scalar histogram dura = " << hist_us << " us" << std::endl;
+            // 指令估算
+            int hist_ops_per_dot = 2 * g_L + 256;   // L histogram updates + ~256 mul+add
+            int std_ops_per_dot  = 2 * g_L - 1;     // 512 mul + 511 add
+            std::cout << "  估算操作数/点积: 标量=" << std_ops_per_dot
+                      << "  直方图=" << hist_ops_per_dot
+                      << "  变化=" << (hist_ops_per_dot - std_ops_per_dot) * 100 / std_ops_per_dot << "%" << std::endl;
+        }
         if (run_i8mm) {
             TimoPoint t0 = std::chrono::high_resolution_clock::now();
             for (int i = 0; i < loopCnt; ++i) matmul_int8_i8mm_complete(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L);
@@ -1083,7 +1126,7 @@ int main(int argc, char **argv)
     {
         bool any_cache = run_fp8_scalar || run_fp8_sve || run_fp8_opt || run_fp8_preshift || run_fp8_preshift_opt
                       || run_fp16 || run_i8_scalar || run_i8_sve || run_i8mm
-                      || run_i8_sve_macc2 || run_i8_sve_macc4 || run_i8_scalar_macc4 || run_i8_distributive || run_i8_sve_distributive;
+                      || run_i8_sve_macc2 || run_i8_sve_macc4 || run_i8_scalar_macc4 || run_i8_distributive || run_i8_sve_distributive || run_i8_histogram;
         if (any_cache) {
             std::cout << "\n--- Cache Miss Rates (L1/L2) ---\n";
             std::cout << std::left << std::setw(32) << "Kernel"
@@ -1126,6 +1169,10 @@ int main(int argc, char **argv)
         if (run_i8_sve_distributive) {
             report("INT8 SVE sdot (对照)",  [&](){ matmul_int8_sve(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
             report("INT8 SVE sdot 分配律版", [&](){ matmul_int8_sve_distributive(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
+        }
+        if (run_i8_histogram) {
+            report("INT8 标量 (对照)",     [&](){ matmul_int8_scalar(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
+            report("INT8 标量 直方图版",   [&](){ matmul_int8_scalar_histogram(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
         }
         if (run_i8mm)            report("INT8 I8MM smmla",  [&](){ matmul_int8_i8mm_complete(a_i8.data(), b_i8.data(), res_i32.data(), g_N, g_S, g_L); });
         if (any_cache) std::cout << "\n";
