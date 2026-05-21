@@ -24,6 +24,7 @@ void load_bin(const std::string &path, T *data, size_t size)
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 #include <functional>
 #include <iomanip>
@@ -562,7 +563,8 @@ void matmul_int8_sve_distributive(const int8_t *a_src, const int8_t *B_T, int32_
  * INT8 标量直方图版 — 以 A 值为 key 分组累加 B_T，利用分配律减少乘法
  *
  * C[i][j] = Σ_v v × (Σ_{k: A[i][k]=v} B_T[j][k])
- * 先按 A 值收集 B_T 列到直方图，再乘 A 值累加。
+ * 分两步：(1) 按 A 值将 B_T 列散列到按 key 分组的扁平缓冲区（不累加），
+ *         (2) 逐 key 求和（SVE 向量化）。
  */
 void matmul_int8_scalar_histogram(const int8_t *A, const int8_t *B_T, int32_t *C,
                                   int N, int S, int L)
@@ -570,21 +572,33 @@ void matmul_int8_scalar_histogram(const int8_t *A, const int8_t *B_T, int32_t *C
     for (int i = 0; i < N; ++i) {
         const int8_t *rowA = A + i * L;
         for (int j = 0; j < S; ++j) {
-            int32_t bucket[256] = {0};
             const int8_t *rowB = B_T + j * L;
-            // SVE gather-add-scatter 直方图累加
-            // 注意：同一向量内相同 A 值会导致冲突（多个 lane 写同个 bucket），此处不做特殊处理
-            int k = 0;
-            svbool_t pg = svwhilelt_b8(k, L);
-            while (svptest_any(svptrue_b8(), pg)) {
-                svuint32_t idx = svld1ub_u32(pg, (const uint8_t*)&rowA[k]);
-                svint32_t b32 = svld1sb_s32(pg, &rowB[k]);
-                svint32_t old = svld1_gather_u32index_s32(pg, bucket, idx);
-                svst1_scatter_u32index_s32(pg, bucket, idx, svadd_s32_m(pg, old, b32));
-                k += svcntb();
-                pg = svwhilelt_b8(k, L);
+            // Phase 1: 统计每 key 出现次数
+            int cnt[256] = {0};
+            for (int k = 0; k < L; ++k) cnt[(uint8_t)rowA[k]]++;
+            // 前缀和求每 key 在扁平缓冲区的偏移
+            int off[256], total = 0;
+            for (int v = 0; v < 256; ++v) { off[v] = total; total += cnt[v]; }
+            // 扁平缓冲区存放按 key 分组的 B 值
+            int32_t *buf = (int32_t *)alloca(total * sizeof(int32_t));
+            memset(cnt, 0, sizeof(cnt));  // 复用作每组已填计数
+            for (int k = 0; k < L; ++k) {
+                uint8_t key = (uint8_t)rowA[k];
+                buf[off[key] + cnt[key]++] = (int32_t)rowB[k];
             }
-            // SVE 加速求和：Σ bucket[v] × (int8_t)v
+            // Phase 2: SVE 逐 key 求和 → flat_bucket
+            int32_t bucket[256] = {0};
+            for (int v = 0; v < 256; ++v) {
+                int n = cnt[v];
+                const int32_t *ptr = buf + off[v];
+                svint32_t sum = svdup_n_s32(0);
+                int p = 0;
+                for (; p + svcntw() <= n; p += svcntw())
+                    sum = svadd_s32_x(svptrue_b32(), sum, svld1_s32(svptrue_b32(), &ptr[p]));
+                for (; p < n; ++p) bucket[v] += ptr[p];
+                bucket[v] += svaddv_s32(svptrue_b32(), sum);
+            }
+            // Phase 3: Σ bucket[v] × (int8_t)v  (SVE)
             static int32_t v_vals[256];
             static bool v_init = false;
             if (!v_init) {
