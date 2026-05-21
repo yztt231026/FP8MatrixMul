@@ -574,12 +574,20 @@ void matmul_int8_scalar_histogram(const int8_t *A, const int8_t *B_T, int32_t *C
             const int8_t *rowB = B_T + j * L;
             for (int k = 0; k < L; ++k)
                 bucket[(uint8_t)rowA[k]] += (int32_t)rowB[k];
-            int32_t sum = 0;
-            for (int v = 0; v < 256; ++v) {
-                int32_t cnt = bucket[v];
-                if (cnt) sum += (int32_t)((int8_t)v) * cnt;
+            // SVE 加速求和：Σ bucket[v] × (int8_t)v
+            static int32_t v_vals[256];
+            static bool v_init = false;
+            if (!v_init) {
+                for (int v = 0; v < 256; ++v) v_vals[v] = (int32_t)((int8_t)v);
+                v_init = true;
             }
-            C[i * S + j] = sum;
+            svint32_t sum_v = svdup_n_s32(0);
+            for (int v = 0; v < 256; v += svcntw()) {
+                svint32_t vb = svld1_s32(svptrue_b32(), &bucket[v]);
+                svint32_t vv = svld1_s32(svptrue_b32(), &v_vals[v]);
+                sum_v = svmla_s32_x(svptrue_b32(), sum_v, vb, vv);
+            }
+            C[i * S + j] = svaddv_s32(svptrue_b32(), sum_v);
         }
     }
 }
