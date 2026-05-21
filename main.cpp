@@ -465,6 +465,26 @@ void matmul_int8_scalar_macc4(const int8_t *A, const int8_t *B_T, int32_t *C, in
 }
 
 /**
+ * 分配律实验预处理：生成每行前 rep_k 个值重复的 A 矩阵，预计算 partial_B
+ */
+void preprocess_distributive(int8_t *a_dist, int32_t *partial_B,
+                             const int8_t *a_src, const int8_t *B_T,
+                             int N, int S, int L, int rep_k)
+{
+    for (int i = 0; i < N; ++i) {
+        int8_t rv = (int8_t)(rand() % 256 - 128);
+        int8_t *row = a_dist + i * L;
+        for (int k = 0; k < rep_k; ++k) row[k] = rv;
+        for (int k = rep_k; k < L; ++k) row[k] = a_src[i * L + k];
+    }
+    for (int j = 0; j < S; ++j) {
+        int32_t sum = 0;
+        for (int k = 0; k < rep_k; ++k) sum += (int32_t)B_T[j * L + k];
+        partial_B[j] = sum;
+    }
+}
+
+/**
  * INT8 标量分配律版 — 利用 a×b + a×c = a×(b+c) 减少乘法次数
  *
  * A 矩阵每行前 rep_k 个值相同，预计算 partial_B[j] = Σ B_T[j][k] for k=0..rep_k-1
@@ -785,17 +805,12 @@ int main(int argc, char **argv)
     std::vector<int8_t> a_i8_distributive(g_N * g_L);
     std::vector<int32_t> partial_B(g_S, 0);
     {
-        for (int i = 0; i < g_N; ++i) {
-            int8_t rv = (int8_t)(rand() % 256 - 128);
-            int8_t *row = &a_i8_distributive[i * g_L];
-            for (int k = 0; k < rep_k; ++k) row[k] = rv;
-            for (int k = rep_k; k < g_L; ++k) row[k] = a_i8[i * g_L + k];
-        }
-        for (int j = 0; j < g_S; ++j) {
-            int32_t sum = 0;
-            for (int k = 0; k < rep_k; ++k) sum += (int32_t)b_i8[j * g_L + k];
-            partial_B[j] = sum;
-        }
+        TimoPoint tp0 = std::chrono::high_resolution_clock::now();
+        preprocess_distributive(a_i8_distributive.data(), partial_B.data(),
+                                a_i8.data(), b_i8.data(),
+                                g_N, g_S, g_L, rep_k);
+        TimoPoint tp1 = std::chrono::high_resolution_clock::now();
+        std::cout << "distributive preprocess dura = " << (tp1 - tp0).count() / 1000.0 << " us (one-time)" << std::endl;
     }
 
     // 初始化 A_shifted（文件数据已加载）
