@@ -24,7 +24,6 @@ void load_bin(const std::string &path, T *data, size_t size)
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <cstdlib>
 #include <string>
 #include <functional>
 #include <iomanip>
@@ -563,7 +562,7 @@ void matmul_int8_sve_distributive(const int8_t *a_src, const int8_t *B_T, int32_
  * INT8 标量直方图版 — 以 A 值为 key 分组累加 B_T，利用分配律减少乘法
  *
  * C[i][j] = Σ_v v × (Σ_{k: A[i][k]=v} B_T[j][k])
- * 分两步：(1) 按 A 值将 B_T 列散列到按 key 分组的扁平缓冲区（不累加），
+ * 分两步：(1) 按 A 值将 B_T 列散列到 bucket[key][*]（二维数组，不累加），
  *         (2) 逐 key 求和（SVE 向量化）。
  */
 void matmul_int8_scalar_histogram(const int8_t *A, const int8_t *B_T, int32_t *C,
@@ -573,32 +572,27 @@ void matmul_int8_scalar_histogram(const int8_t *A, const int8_t *B_T, int32_t *C
         const int8_t *rowA = A + i * L;
         for (int j = 0; j < S; ++j) {
             const int8_t *rowB = B_T + j * L;
-            // Phase 1: 统计每 key 出现次数
-            int cnt[256] = {0};
-            for (int k = 0; k < L; ++k) cnt[(uint8_t)rowA[k]]++;
-            // 前缀和求每 key 在扁平缓冲区的偏移
-            int off[256], total = 0;
-            for (int v = 0; v < 256; ++v) { off[v] = total; total += cnt[v]; }
-            // 扁平缓冲区存放按 key 分组的 B 值
-            int32_t *buf = (int32_t *)alloca(total * sizeof(int32_t));
-            memset(cnt, 0, sizeof(cnt));  // 复用作每组已填计数
+            // Phase 1: 按 A 值将 B 散列到 bucket[key][*]
+            static int32_t bucket[256][512];
+            static int32_t cnt[256];
+            memset(cnt, 0, sizeof(cnt));
             for (int k = 0; k < L; ++k) {
                 uint8_t key = (uint8_t)rowA[k];
-                buf[off[key] + cnt[key]++] = (int32_t)rowB[k];
+                bucket[key][cnt[key]++] = (int32_t)rowB[k];
             }
             // Phase 2: SVE 逐 key 求和 → flat_bucket
-            int32_t bucket[256] = {0};
+            int32_t flat[256] = {0};
             for (int v = 0; v < 256; ++v) {
                 int n = cnt[v];
-                const int32_t *ptr = buf + off[v];
+                const int32_t *row = bucket[v];
                 svint32_t sum = svdup_n_s32(0);
                 int p = 0;
                 for (; p + svcntw() <= n; p += svcntw())
-                    sum = svadd_s32_x(svptrue_b32(), sum, svld1_s32(svptrue_b32(), &ptr[p]));
-                for (; p < n; ++p) bucket[v] += ptr[p];
-                bucket[v] += svaddv_s32(svptrue_b32(), sum);
+                    sum = svadd_s32_x(svptrue_b32(), sum, svld1_s32(svptrue_b32(), &row[p]));
+                for (; p < n; ++p) flat[v] += row[p];
+                flat[v] += svaddv_s32(svptrue_b32(), sum);
             }
-            // Phase 3: Σ bucket[v] × (int8_t)v  (SVE)
+            // Phase 3: Σ flat[v] × (int8_t)v  (SVE)
             static int32_t v_vals[256];
             static bool v_init = false;
             if (!v_init) {
@@ -607,7 +601,7 @@ void matmul_int8_scalar_histogram(const int8_t *A, const int8_t *B_T, int32_t *C
             }
             svint32_t sum_v = svdup_n_s32(0);
             for (int v = 0; v < 256; v += svcntw()) {
-                svint32_t vb = svld1_s32(svptrue_b32(), &bucket[v]);
+                svint32_t vb = svld1_s32(svptrue_b32(), &flat[v]);
                 svint32_t vv = svld1_s32(svptrue_b32(), &v_vals[v]);
                 sum_v = svmla_s32_x(svptrue_b32(), sum_v, vb, vv);
             }
